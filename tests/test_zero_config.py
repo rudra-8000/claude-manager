@@ -71,3 +71,24 @@ class RemoteControlLinkTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PortTests(unittest.TestCase):
+    def test_recognises_cm_servers(self):
+        from cmgr.ports import is_cm_server
+        self.assertTrue(is_cm_server("/home_local/rudra_1/miniforge3/bin/python3.13 -m cmgr serve"))
+        self.assertTrue(is_cm_server("/home_local/rudra_1/miniforge3/bin/python3.13 /home_local/rudra_1/miniforge3/bin/cm serve"))
+        self.assertTrue(is_cm_server(r'"C:\Users\rudra\anaconda3\Scripts\cm.exe" serve'))
+        self.assertTrue(is_cm_server("cm serve --port 8766"))
+        self.assertFalse(is_cm_server(r"C:\Program Files\Microsoft VS Code\Code.exe --type=utility"))
+        self.assertFalse(is_cm_server("python -m http.server 8765"))
+
+    def test_parsers(self):
+        from cmgr.ports import parse_netstat, parse_ss
+        ss = 'LISTEN 0 5 100.115.95.117:8765 0.0.0.0:* users:(("python3.13",pid=4242,fd=3))\n' \
+             'LISTEN 0 5 127.0.0.1:8765 0.0.0.0:* users:(("python3.13",pid=4242,fd=4))\n'
+        self.assertEqual(parse_ss(ss), [4242])
+        ns = "  TCP    127.0.0.1:8765         0.0.0.0:0              LISTENING       51132\n" \
+             "  TCP    127.0.0.1:18765        0.0.0.0:0              LISTENING       7\n" \
+             "  TCP    10.0.0.2:51000         1.2.3.4:443            ESTABLISHED     9\n"
+        self.assertEqual(parse_netstat(ns, 8765), [51132])

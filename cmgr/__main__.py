@@ -69,6 +69,7 @@ def cmd_up(a) -> None:
             print("open: " + "  or  ".join(_urls(cfg)))
             return
         _stop(mux)
+    _free_port(int(cfg["port"]))
     exe = sys.executable
     args = " -m cmgr serve" + (f" --port {a.port}" if a.port else "") + (f' --config "{a.config}"' if a.config else "")
     # typed into the session's shell, so a crash stays readable with `tmux attach -t cm`
@@ -79,8 +80,24 @@ def cmd_up(a) -> None:
     out = [ln for ln in strip_ansi(mux.capture(SESSION)).splitlines() if ln.strip()]
     tail = [ln for ln in out if "[cm]" in ln or "Error" in ln or "error" in ln][-6:]
     print("\n".join(tail) if tail else "\n".join(out[-6:]))
-    print(f"\nrunning in tmux session '{SESSION}' (see it with: tmux attach -t {SESSION})")
+    if not any("listening on" in ln for ln in out):
+        mux._run("kill-session", "-t", SESSION)
+        raise SystemExit("\ncm did NOT start (see above). Nothing is left running.")
+    print(f"\nrunning in tmux session '{SESSION}' (see it with: tmux attach -t {SESSION}, leave with Ctrl-b d)")
     print("open: " + "  or  ".join(_urls(cfg)))
+
+
+def _free_port(port: int) -> None:
+    """An older cm still listening (e.g. a `cm serve` started by hand) is stopped; anything else is reported."""
+    from . import ports
+    for h in ports.holders(port):
+        if h["is_cm"]:
+            ok = ports.stop(h["pid"])
+            print(f"stopped an older cm on port {port} (pid {h['pid']})" if ok
+                  else f"could not stop the older cm on port {port} (pid {h['pid']}); stop it by hand")
+        else:
+            print(f"note: port {port} is partly taken by pid {h['pid']} ({h['cmd'][:80] or 'unknown'}); "
+                  "addresses it holds will be skipped")
 
 
 def cmd_down(a) -> None:
@@ -103,6 +120,10 @@ def cmd_doctor(a) -> None:
     st = ts.status()
     print(f"[{ok(st['running'])}] tailscale: " + (", ".join(st["self"]["ips"]) if st["running"] else "not running / logged out"))
     print(f"       will listen on: {', '.join(resolve_binds(cfg['bind'])) or 'nothing!'}")
+    from . import ports
+    for h in ports.holders(int(cfg["port"])):
+        what = "cm (fine if it's the one `cm up` started)" if h["is_cm"] else (h["cmd"][:70] or "unknown program")
+        print(f"       port {cfg['port']} in use by pid {h['pid']}: {what}")
     accts = agent.accounts()
     print(f"[{ok(bool(accts))}] accounts: {len(accts)}")
     for acc in accts:

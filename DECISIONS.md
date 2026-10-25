@@ -1,5 +1,11 @@
 # DECISIONS - claude-manager
 
+## D-004  [FIX, v0.2.1] `cm up` replaces an older cm that still holds the port, and reports a failed start as a failure   [found on computenode-01 on the first `cm up` after the update]  2026-10-25
+
+1. WHAT HAPPENED. On computenode-01 the `cm serve` started by hand under v0.1 was still running. The new server could bind neither 100.115.95.117:8765 nor 127.0.0.1:8765 and exited, yet `cm up` still printed "running in tmux session 'cm'".
+2. FIX (`cmgr/ports.py`, `cm up`). Before starting, `cm up` lists the processes listening on the port (`ss -ltnp`, falling back to `lsof` on Linux; `netstat -ano` on Windows) and reads their command lines. A process whose command line is a cm server (`-m cmgr serve` or `cm serve`) is stopped with SIGTERM, or taskkill on Windows, and the stop is printed. Any other program is only reported, for example VS Code on 127.0.0.1:8765 on rudy, which is skipped by the bind logic of D-003. After starting, if the session's output has no "listening on" line, `cm up` kills the session, says "cm did NOT start", and exits 1. `cm doctor` shows who holds the port.
+3. VERIFIED in WSL with real tmux: a hand-started server (pid 524) was stopped and the new one took over both addresses; with the only address blocked by another program, cm up exited 1 and left no session behind. 43 tests (new: cm-server recognition, ss / netstat parsing).
+
 ## D-003  [SETUP, v0.2] Zero configuration: Tailscale finds the machines and decides who may connect, Claude Code's own history supplies the projects, one command per machine (`cm up`); Remote Control used only as a deep link   [machines: rudy (Windows, psmux) + guru, computenode-01, rudy8k (Ubuntu); supersedes the token / peers / project_roots setup of D-001]  2026-10-25
 
 1. TRIGGER (user feedback on the first deploy). The setup was too tedious: a token copied to every machine, peers listed by hand (the README example names `labpc` / `winbox` were copied literally and failed), and project folders listed by hand. On Windows `cm serve` crashed because VS Code already listens on 127.0.0.1:8765 (WinError 10013 after the Tailscale address had bound fine).
