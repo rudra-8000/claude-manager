@@ -115,7 +115,8 @@ async function refreshState() {
     S.state = await api("GET", "/hub/state");
     $("#sync-dot").className = "sync-dot ok";
     renderUsage(); renderSessions(); notifyTransitions();
-    if (!$("#devices-sheet").hidden) renderDevices();
+    // don't redraw the devices panel under the user's fingers (that wiped half-typed SSH targets)
+    if (!$("#devices-sheet").hidden && !$("#devices-sheet").contains(document.activeElement)) renderDevices();
     if (S.current) renderSessionHeader();
   } catch (e) {
     $("#sync-dot").className = "sync-dot bad";
@@ -589,6 +590,8 @@ function updateCount() {
 
 // ------------------------------------------------------------------ devices & accounts
 const S_OPEN = new Set();   // devices whose SSH form is expanded
+const S_DRAFT = new Map();  // "device\u0000field" -> text typed but not saved yet
+const draft = (name, f, saved) => (S_DRAFT.has(name + "\u0000" + f) ? S_DRAFT.get(name + "\u0000" + f) : saved || "");
 function openDevices() { $("#devices-sheet").hidden = false; renderDevices(); }
 function renderDevices() {
   const st = S.state;
@@ -597,7 +600,7 @@ function renderDevices() {
     (key login must already work from ${esc(st.hub)} without a password; nothing gets installed), or directly if they run <code>cm</code>.`;
   $("#devices-list").innerHTML = (st.devices || []).map((d) => {
     const self = d.status === "this machine";
-    const usable = self || d.has_agent || d.via === "ssh";
+    const usable = self || d.mode != null;   // cm running there, an ssh alias, or SSH set up here
     const err = d.status.startsWith("error");
     const showForm = !self && (S_OPEN.has(d.name) || err);
     const os = d.os === "win32" || d.os === "windows" ? "Windows" : d.os || "";
@@ -606,10 +609,11 @@ function renderDevices() {
         <span class="badge">${esc(os)}</span>
         <label class="switch" title="show this device's sessions"><input type="checkbox" data-act="toggle" data-usable="${usable ? 1 : 0}" ${d.enabled ? "checked" : ""} ${self ? "" : ""}><span></span></label></div>
       <div class="dev-status${err ? " err" : ""}">${esc(d.status)}${!self && !showForm ? ` · <a href="#" data-act="edit">${usable ? "SSH settings" : "Set up SSH"}</a>` : ""}</div>
-      ${showForm ? `<div class="dev-ssh"><input data-f="ssh" placeholder="${esc("user@" + d.name)}" value="${esc(d.ssh)}" autocapitalize="off" autocorrect="off" spellcheck="false">
-        <input data-f="python" placeholder="${os === "Windows" ? "python" : "python3"}" value="${esc(d.python)}" autocapitalize="off" spellcheck="false"></div>
+      ${showForm ? `<div class="dev-ssh"><input data-f="ssh" placeholder="${esc(d.ssh_alias || "user@" + d.name)}" value="${esc(draft(d.name, "ssh", d.ssh))}" autocapitalize="off" autocorrect="off" spellcheck="false" aria-label="ssh target">
+        <input data-f="python" placeholder="${os === "Windows" ? "python" : "python3"}" value="${esc(draft(d.name, "python", d.python))}" autocapitalize="off" spellcheck="false" aria-label="python on that machine"></div>
+        <div class="muted small">${d.ssh_alias ? `Leave empty to use <code>ssh ${esc(d.ssh_alias)}</code> from the hub's ~/.ssh/config.` : `Anything that works as <code>ssh &lt;this&gt;</code> on ${esc(st.hub)}: an alias from ~/.ssh/config or user@host.`}</div>
         <div class="dev-actions"><button class="btn small primary" data-act="ssh">${d.via === "ssh" ? "Save" : "Connect over SSH"}</button>
-        ${d.via === "ssh" ? `<button class="btn small" data-act="auto">Stop using SSH</button>` : ""}</div>` : ""}
+        ${d.via === "ssh" ? `<button class="btn small" data-act="auto">Reset</button>` : ""}</div>` : ""}
     </div>`;
   }).join("");
   const hid = hidden();
@@ -631,6 +635,7 @@ async function deviceAction(e) {
   if (act === "toggle") body = { name, enabled: e.target.checked };
   else if (act === "ssh") {
     body = { name, via: "ssh", enabled: true, ssh: $("[data-f=ssh]", dev).value.trim(), python: $("[data-f=python]", dev).value.trim() };
+    S_DRAFT.delete(name + "\u0000ssh"); S_DRAFT.delete(name + "\u0000python");
     e.target.disabled = true; e.target.textContent = "Connecting…";
   } else if (act === "auto") body = { name, via: "auto" };
   if (!body) return;
@@ -857,6 +862,16 @@ function bind() {
   $("#devices-list").addEventListener("click", (e) => { if (e.target.dataset.act && e.target.dataset.act !== "toggle") deviceAction(e); });
   $("#devices-list").addEventListener("change", (e) => { if (e.target.dataset.act === "toggle") deviceAction(e); });
   $("#accounts-list").addEventListener("change", accountToggle);
+  $("#devices-list").addEventListener("input", (e) => {
+    const dev = e.target.closest(".dev");
+    if (dev && e.target.dataset.f) S_DRAFT.set(dev.dataset.name + "\u0000" + e.target.dataset.f, e.target.value);
+  });
+  $("#devices-list").addEventListener("keydown", (e) => {
+    if (e.key !== "Enter" || !e.target.dataset.f) return;
+    e.preventDefault();
+    const b = e.target.closest(".dev").querySelector("[data-act=ssh]");
+    if (b) b.click();
+  });
   $("#projects").onclick = (e) => {
     const b = e.target.closest("[data-act]");
     if (!b) return;

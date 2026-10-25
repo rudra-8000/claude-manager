@@ -239,8 +239,9 @@ def screen_status(screen: str, registry_status: str = "") -> str:
     return "idle"
 
 
-_RULE = re.compile(r"^[─━═\s]{8,}$")
-_HINT = re.compile(r"^[─━═╭╮╰╯│\s]*$|^[❯>]\s|^[❯>]$|shift\+tab|\? for shortcuts|auto mode|accept edits|"
+# Newer Claude Code puts the session name inside the rule above the input: "──── trnsfr ─"
+_RULE = re.compile(r"^\s*[─━═]{3,}")
+_HINT = re.compile(r"^[─━═╭╮╰╯│\s]*$|^\s*[─━═]{3,}|^[❯>]\s|^[❯>]$|shift\+tab|\? for shortcuts|auto mode|accept edits|"
                    r"bypass permissions|plan mode|new task\?|/clear to save|Update installed|Restart to update|"
                    r"· /[a-z-]+$|ctrl\+g to edit")
 

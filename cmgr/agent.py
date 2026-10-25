@@ -91,13 +91,28 @@ class Agent:
                 try:
                     screen = self.mux.capture(p.target)
                     d["status"] = screen_status(screen, proc.status if proc else "")
-                    d["preview"] = last_text_line(screen)
+                    d["preview"] = self._chat_preview(proc, procs) or last_text_line(screen)
                 except MuxError:
                     d["status"] = "unknown"
             elif p.dead:
                 d["status"] = "dead"
             out.append(d)
         return out
+
+    @staticmethod
+    def _transcript_path(proc, procs) -> str | None:
+        # two sessions in one folder: never hand one of them the other's transcript
+        others = {q.session_id for q in procs if q is not proc and q.account_dir == proc.account_dir and q.cwd == proc.cwd}
+        return transcript_mod.find(proc.account_dir, proc.cwd, proc.session_id, proc.started_at - 5, others)
+
+    def _chat_preview(self, proc, procs) -> str:
+        if not proc:
+            return ""
+        try:
+            path = self._transcript_path(proc, procs)
+            return transcript_mod.last_message(path) if path else ""
+        except OSError:
+            return ""
 
     def _check_target(self, target: str):
         for p in self.mux.list_panes():
@@ -115,10 +130,11 @@ class Agent:
 
     def transcript(self, target: str, before: int | None = None, since: int | None = None) -> dict:
         p = self._check_target(target)
-        proc = match_proc(p, read_registry(self.accounts()))
+        procs = read_registry(self.accounts())
+        proc = match_proc(p, procs)
         if not proc:
             raise AgentError("no Claude Code session recorded for this pane", 404)
-        path = transcript_mod.find(proc.account_dir, proc.cwd, proc.session_id, proc.started_at - 5)
+        path = self._transcript_path(proc, procs)
         if not path:
             raise AgentError("this session has no transcript yet", 404)
         return transcript_mod.read(path, before=before, since=since)

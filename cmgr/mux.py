@@ -106,9 +106,56 @@ def safe_session_name(name: str) -> str:
     return name[:40] or "claude"
 
 
+_COMMON = ["~/miniforge3/bin/tmux", "~/mambaforge/bin/tmux", "~/miniconda3/bin/tmux", "~/anaconda3/bin/tmux",
+           "~/.local/bin/tmux", "/usr/local/bin/tmux", "/opt/homebrew/bin/tmux", "/usr/bin/tmux", "/snap/bin/tmux"]
+
+
+def running_server_binary() -> str | None:
+    """The executable of a tmux server this user is running (Linux). Over a non-interactive ssh login, PATH
+    may lack conda's tmux, and a different tmux version may not speak to the running server at all."""
+    if not os.path.isdir("/proc"):
+        return None
+    uid = os.getuid()
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            if os.stat(f"/proc/{pid}").st_uid != uid:
+                continue
+            with open(f"/proc/{pid}/comm") as f:
+                if not f.read().startswith("tmux"):
+                    continue
+            exe = os.readlink(f"/proc/{pid}/exe")
+        except OSError:
+            continue
+        exe = exe.replace(" (deleted)", "")
+        if os.path.isfile(exe):
+            return exe
+    return None
+
+
+def find_tmux() -> str:
+    if sys.platform != "win32":
+        found = running_server_binary()
+        if found:
+            return found
+    found = shutil.which("tmux") or shutil.which("psmux")
+    if found:
+        return found
+    for p in _COMMON:
+        p = os.path.expanduser(p)
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    if sys.platform == "win32":
+        links = os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WinGet\Links\tmux.exe")
+        if os.path.isfile(links):
+            return links
+    return "tmux"
+
+
 class Mux:
     def __init__(self, binary: str | None = None, timeout: float = 5.0):
-        self.binary = binary or shutil.which("tmux") or shutil.which("psmux") or "tmux"
+        self.binary = binary or find_tmux()
         self.timeout = timeout
 
     def _run(self, *args: str, input: str | None = None, check: bool = True) -> str:

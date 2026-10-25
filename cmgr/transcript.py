@@ -20,10 +20,12 @@ def encode_cwd(cwd: str) -> str:
     return re.sub(r"[^A-Za-z0-9]", "-", cwd)
 
 
-def find(account_dir: str, cwd: str, session_id: str, started_at: float = 0.0) -> str | None:
+def find(account_dir: str, cwd: str, session_id: str, started_at: float = 0.0, others: set | None = None) -> str | None:
+    """`others`: session ids of the other live sessions in the same folder, whose files must not be taken."""
     d = os.path.join(account_dir, "projects", encode_cwd(cwd))
     exact = os.path.join(d, f"{session_id}.jsonl") if session_id else ""
-    files = glob.glob(os.path.join(d, "*.jsonl"))
+    skip = {os.path.join(d, f"{o}.jsonl") for o in (others or ()) if o != session_id}
+    files = [f for f in glob.glob(os.path.join(d, "*.jsonl")) if f not in skip]
     if not files:
         return None
     newest = max(files, key=os.path.getmtime)
@@ -98,6 +100,40 @@ def parse_lines(lines: list[str]) -> list[dict]:
                     items.append({"kind": "tool", "tool_id": b.get("id", ""), "name": name,
                                   "summary": _tool_summary(name, b.get("input") or {}), "ts": ts})
     return items
+
+
+_last_cache: dict[str, tuple[int, str]] = {}
+
+
+def last_message(path: str, tail: int = 256_000) -> str:
+    """One-line preview: the last thing Claude said (or the last prompt / tool, if nothing yet).
+    Cached per file size, so it costs nothing while a session is idle."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return ""
+    hit = _last_cache.get(path)
+    if hit and hit[0] == size:
+        return hit[1]
+    with open(path, "rb") as f:
+        f.seek(max(0, size - tail))
+        data = f.read()
+    lines = data.decode("utf-8", "replace").splitlines()[1 if size > tail else 0:]
+    text = ""
+    for it in reversed(parse_lines(lines)):   # the latest of: Claude's text, a tool it is running, your prompt
+        if it["kind"] == "assistant":
+            text = next((l for l in it["text"].splitlines() if l.strip()), "")
+        elif it["kind"] == "tool":
+            text = f"{it['name']}: {it['summary']}"
+        elif it["kind"] == "user":
+            text = "you: " + (it["text"].strip().splitlines() or [""])[0]
+        else:
+            continue
+        break
+    text = re.sub(r"\*\*|__|`", "", text)          # emphasis and code marks only; paths keep their underscores
+    text = re.sub(r"^[#>\s]+", "", text).strip()[:200]
+    _last_cache[path] = (size, text)
+    return text
 
 
 def read(path: str, before: int | None = None, since: int | None = None) -> dict:

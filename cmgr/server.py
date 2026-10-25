@@ -16,10 +16,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import wait as futures_wait
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .agent import Agent, AgentError
 from .mux import MuxError
+from . import sshconfig
 from .tailscale import Tailscale, is_loopback
 
 WEB_DIR = os.path.join(os.path.dirname(__file__), "web")
@@ -131,6 +133,7 @@ class Hub:
         self.agents: dict[str, RemoteClient] = {}     # device name -> cm found running there
         self.ssh: dict[str, object] = {}              # device name -> SSHClient
         self.discovered_at = 0.0
+        self.inflight: dict = {}                      # device name -> running snapshot future
         self._discover_lock = threading.Lock()
         self._settings_lock = threading.Lock()
         self.settings_path = os.path.join(os.path.dirname(cfg["_path"]), "hub.json")
@@ -210,8 +213,38 @@ class Hub:
         finally:
             self._discover_lock.release()
 
+    def ssh_aliases(self) -> dict[str, str]:
+        """{device name: alias} from the hub's own ~/.ssh/config (`Host robot` / `HostName guru`)."""
+        if not self.cfg.get("ssh_aliases", True):
+            return {}
+        try:
+            return sshconfig.cached_match(self.ts.my_devices())
+        except Exception:
+            return {}
+
+    def _os_of(self, name: str) -> str:
+        return next((m["os"] for m in self.ts.my_devices() if m["label"] == name), "")
+
+    def _route(self, name: str, settings: dict | None = None, aliases: dict | None = None) -> dict:
+        """How to reach a device: {"mode": self|agent|ssh|None, "target", "python"}."""
+        if name == self.cfg["name"]:
+            return {"mode": "self"}
+        d = (settings if settings is not None else self.settings())["devices"].get(name, {})
+        aliases = aliases if aliases is not None else self.ssh_aliases()
+        wants_ssh = d.get("via") == "ssh" or (name not in self.agents and name in aliases)
+        if wants_ssh:
+            win = self._os_of(name) in ("windows", "win32")
+            return {"mode": "ssh", "target": d.get("ssh") or aliases.get(name) or name,
+                    "python": d.get("python") or ("python" if win else "python3"),
+                    "from_config": not d.get("ssh") and name in aliases}
+        if name in self.agents:
+            return {"mode": "agent"}
+        return {"mode": None}
+
     def devices(self) -> list[dict]:
-        s = self.settings()["devices"]
+        settings = self.settings()
+        s = settings["devices"]
+        aliases = self.ssh_aliases()
         me = self.cfg["name"]
         mine = set(self.ts.my_ips())
         rows = [{"name": me, "kind": "this machine", "online": True, "os": sys.platform, "ip": ""}]
@@ -227,13 +260,17 @@ class Hub:
                 rows.append({"name": name, "kind": "configured", "online": True, "os": "", "ip": ""})
         for r in rows:
             d = s.get(r["name"], {})
+            route = self._route(r["name"], settings, aliases)
             r["via"] = d.get("via", "auto")
             r["ssh"] = d.get("ssh", "")
             r["python"] = d.get("python", "")
+            r["ssh_alias"] = aliases.get(r["name"], "")
             r["has_agent"] = r["name"] in self.agents
-            usable = r["name"] == me or r["has_agent"] or r["via"] == "ssh"
-            r["enabled"] = bool(d.get("enabled", usable)) and usable
+            r["mode"] = route["mode"]
+            usable = route["mode"] is not None
+            r["enabled"] = bool(d.get("enabled", True)) and usable
             last = self.last.get(r["name"])
+            fut = self.inflight.get(r["name"])
             if r["name"] == me:
                 r["status"] = "this machine"
             elif not r["online"]:
@@ -242,22 +279,27 @@ class Hub:
                 r["status"] = "not connected"
             elif not r["enabled"]:
                 r["status"] = "hidden"
+            elif not last and fut is not None and not fut.done():
+                r["status"] = "connecting…"
             elif last and not last.get("ok"):
                 r["status"] = "error: " + (last.get("error") or "")
+            elif route["mode"] == "ssh":
+                r["status"] = f"connected: ssh {route['target']}" + (" (from ~/.ssh/config)" if route.get("from_config") else "")
             else:
-                r["status"] = ("connected over SSH" if r["via"] == "ssh" else "connected (cm running there)")
+                r["status"] = "connected (cm running there)"
         return rows
 
     def _client(self, name: str):
-        if name == self.cfg["name"]:
+        route = self._route(name)
+        if route["mode"] == "self":
             return self.local
-        d = self.settings()["devices"].get(name, {})
-        if d.get("via") == "ssh":
+        if route["mode"] == "ssh":
             c = self.ssh.get(name)
-            if c is None:
+            if c is None or (c.target, c.python) != (route["target"], route["python"]):
+                if c is not None:
+                    c.close()
                 from .remote import SSHClient
-                target = d.get("ssh") or name
-                c = self.ssh[name] = SSHClient(target, d.get("python") or "python3")
+                c = self.ssh[name] = SSHClient(route["target"], route["python"])
             return c
         return self.agents.get(name)
 
@@ -284,9 +326,29 @@ class Hub:
         self.last[name] = entry
         return entry
 
+    def snapshots(self, names: list[str], wait: float = 6.0) -> list[dict]:
+        """Refresh every device in parallel, but never let a slow one (an ssh connect, a dead host) hold up
+        the page: after `wait` seconds its last known data is returned and the refresh keeps running."""
+        futs = {}
+        for n in names:
+            f = self.inflight.get(n)
+            if f is None or f.done():
+                f = self.inflight[n] = self.pool.submit(self._snap, n)
+            futs[n] = f
+        futures_wait(list(futs.values()), timeout=wait)
+        out = []
+        for n, f in futs.items():
+            if f.done():
+                out.append(f.result())
+            elif n in self.last:
+                out.append(self.last[n])
+            else:
+                out.append({"name": n, "ok": False, "error": "connecting…", "sessions": [], "usage": [], "info": None})
+        return out
+
     def state(self) -> dict:
         self.discover()
-        hosts = list(self.pool.map(self._snap, self.active()))
+        hosts = self.snapshots(self.active())
         accounts: dict[str, dict] = {}
         for h in hosts:
             for u in h.get("usage") or []:

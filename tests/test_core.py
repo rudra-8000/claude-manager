@@ -138,6 +138,11 @@ class ScreenTests(unittest.TestCase):
              "\n  ⏵⏵ auto mode on (shift+tab to cycle)\n")
         self.assertEqual(cs.last_text_line(s), "✻ Brewed for 2m 9s · done 4:28 PM")
 
+    def test_preview_with_labelled_rule(self):  # newer Claude Code: "──── <session name> ─" above the input
+        s = ("Registering the plan now.\n\n" + "─" * 120 + " trnsfr ─\n❯ \n" + "─" * 130 +
+             "\n  ⏵⏵ auto mode on (shift+tab to cycle)\n")
+        self.assertEqual(cs.last_text_line(s), "Registering the plan now.")
+
 
 class UsageTests(unittest.TestCase):
     def test_limits_list(self):

@@ -22,17 +22,18 @@ cm up                    # starts it in a detached tmux/psmux session called "cm
 Open that address on your phone or laptop with Tailscale on (for example
 `http://computenode-01.<tailnet>.ts.net:8765`) and add it to your home screen.
 
-**Add your other machines** in ⚙ *Devices & accounts*. Every computer on your Tailscale account is listed
-there (phones and machines shared in by other people are left out). For each one:
+**Your other machines connect by themselves** if the hub machine already reaches them with an alias in its
+`~/.ssh/config`: an alias whose `HostName` is the machine's Tailscale name or IP is matched to it (`Host robot` /
+`HostName guru` means guru is reached with `ssh robot`). ⚙ *Devices & accounts* lists every computer on your
+Tailscale account (phones and machines shared in by other people are left out) and shows how each one is reached:
 
-- **Over SSH (nothing to install there):** tap *Set up SSH*, enter how the hub machine reaches it
-  (`user@guru`), and if needed the Python to use (`python3`, or a full path on Windows). The hub opens
-  `ssh` to it, streams its own code over that connection and runs it in memory. The only requirement is
-  that `ssh user@guru` works **from the hub machine** without a password prompt (check with
-  `ssh user@guru true` there; if it asks for a password, run `ssh-copy-id user@guru` once). Python 3.9+ and
-  tmux must be on the other machine, which they already are wherever you run Claude Code in tmux.
-- **Or run `cm up` on it too:** a machine that runs `cm` is picked up automatically, no SSH needed. This is the
-  easy option for Windows, where SSH into psmux needs the Windows OpenSSH server set up.
+- **Over SSH (nothing to install there):** the hub opens `ssh <alias>`, streams its own code over that connection and
+  runs it in memory. Requirements on the other machine: Python 3.9+ and tmux, which you have wherever you run Claude
+  Code in tmux, and key login from the hub without a password. If there's no alias, tap *Set up SSH* and enter what
+  works as `ssh <this>` on the hub (`user@host` or an alias), plus the Python to use if it isn't `python3` (on
+  Windows the default is `python`). The tmux used is the one running your sessions, even if it's a conda install
+  that a non-interactive ssh login doesn't have on PATH.
+- **Or run `cm up` on it too:** a machine that runs `cm` is picked up automatically, no SSH needed.
 
 Switch devices on and off to choose whose sessions you see. In the same panel, switch accounts off to hide their
 sessions. Usage stays visible on the right either way.
@@ -145,7 +146,7 @@ from localhost.
 ## Development
 
 ```bash
-python -m pytest -q tests      # 50 tests
+python -m pytest -q tests      # 55 tests
 ```
 
 Architecture decisions are recorded in [DECISIONS.md](DECISIONS.md).

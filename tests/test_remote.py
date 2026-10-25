@@ -102,7 +102,8 @@ class HubDeviceTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         cfg = {"name": "hubbox", "token": "", "accounts": [], "project_roots": [], "tmux": "", "port": 1,
-               "_path": os.path.join(self.tmp.name, "config.json"), "peers": [], "discover": False}
+               "_path": os.path.join(self.tmp.name, "config.json"), "peers": [], "discover": False,
+               "ssh_aliases": False}  # don't read the developer's real ~/.ssh/config
         agent = Agent(cfg, mux=FakeMux("work"))
         agent._accounts, agent._accounts_at = [], 1e18
         self.ts = FakeTS(machines=[{"name": "guru", "ip": "100.0.0.5"}, {"name": "rudy8k", "ip": "100.0.0.6", "online": False}])
@@ -119,7 +120,7 @@ class HubDeviceTests(unittest.TestCase):
     def test_ssh_device_is_polled_and_can_be_switched_off(self):
         self.hub.set_device("guru", enabled=True, via="ssh", ssh="me@guru", python="python3")
         self.assertEqual(self.dev("guru")["ssh"], "me@guru")
-        self.hub.ssh["guru"] = stdio_client()          # stands in for the real ssh process
+        self.hub.ssh["guru"] = SSHClient("me@guru", "python3", argv=[sys.executable, "-u", "-c", BOOTSTRAP])  # stands in for ssh
         self.addCleanup(lambda: self.hub.ssh.get("guru") and self.hub.ssh["guru"].close())
         self.assertEqual(self.hub.active(), ["hubbox", "guru"])
         st = self.hub.state()
@@ -131,6 +132,42 @@ class HubDeviceTests(unittest.TestCase):
         with open(os.path.join(self.tmp.name, "hub.json")) as f:
             self.assertEqual(json.load(f)["devices"]["guru"], {"enabled": False, "via": "ssh", "ssh": "me@guru", "python": "python3"})
 
+    def test_ssh_config_alias_connects_without_setup(self):
+        self.hub.ssh_aliases = lambda: {"guru": "robot"}
+        r = self.hub._route("guru")
+        self.assertEqual((r["mode"], r["target"], r["python"], r["from_config"]), ("ssh", "robot", "python3", True))
+        self.assertEqual(self.hub.active(), ["hubbox", "guru"])
+        self.hub.set_device("guru", ssh="other-alias")           # an explicit target wins over the config
+        self.assertEqual(self.hub._route("guru")["target"], "other-alias")
+        self.ts.machines.append({"name": "rudy-windows", "ip": "100.0.0.7", "os": "windows"})
+        self.hub.ssh_aliases = lambda: {"rudy-windows": "rudra"}
+        self.assertEqual(self.hub._route("rudy-windows")["python"], "python")   # Windows default
+
+    def test_slow_device_does_not_block_the_page(self):
+        import threading
+        gate = threading.Event()
+
+        class Slow:
+            target, python = "slow", "python3"
+
+            def call(self, *a, **k):
+                gate.wait(10)
+                return {"info": None, "sessions": [], "usage": [], "prefs": {}}
+
+            def close(self):
+                pass
+        self.hub.set_device("guru", enabled=True, via="ssh", ssh="slow", python="python3")
+        self.hub.ssh["guru"] = Slow()
+        import time as _t
+        t0 = _t.time()
+        hosts = {h["name"]: h for h in self.hub.snapshots(self.hub.active(), wait=0.5)}
+        self.assertLess(_t.time() - t0, 3)
+        self.assertEqual(hosts["guru"]["error"], "connecting…")
+        self.assertEqual(self.dev("guru")["status"], "connecting…")
+        gate.set()
+        self.hub.inflight["guru"].result(5)
+        self.assertTrue(self.hub.snapshots(["guru"], wait=2)[0]["ok"])
+
     def test_hidden_accounts(self):
         self.hub.set_account_hidden("acct-1", True)
         self.hub.set_account_hidden("acct-2", True)
@@ -140,3 +177,35 @@ class HubDeviceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PreviewTests(unittest.TestCase):
+    def test_last_message_prefers_latest_activity(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "s.jsonl")
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("\n".join(TRANSCRIPT) + "\n")
+            self.assertEqual(T.last_message(p), "Fixed.")
+            with open(p, "a", encoding="utf-8") as f:
+                f.write(line(type="assistant", message={"content": [{"type": "tool_use", "id": "x", "name": "Bash", "input": {"command": "make"}}]}) + "\n")
+            self.assertEqual(T.last_message(p), "Bash: make")
+            with open(p, "a", encoding="utf-8") as f:
+                f.write(line(type="user", message={"content": "now **ship** it\nplease"}) + "\n")
+            self.assertEqual(T.last_message(p), "you: now ship it")
+
+
+class FindTests(unittest.TestCase):
+    def test_two_sessions_in_one_folder_keep_their_own_transcripts(self):
+        import time as _t
+        with tempfile.TemporaryDirectory() as d:
+            pdir = os.path.join(d, "projects", T.encode_cwd("/w/openpi"))
+            os.makedirs(pdir)
+            a, b = os.path.join(pdir, "A.jsonl"), os.path.join(pdir, "B.jsonl")
+            for f, t in ((a, 1000), (b, 2000)):
+                open(f, "w").close()
+                os.utime(f, (t, t))
+            self.assertEqual(T.find(d, "/w/openpi", "A", 0, others={"B"}), a)   # B is newer but belongs to the other session
+            self.assertEqual(T.find(d, "/w/openpi", "B", 0, others={"A"}), b)
+            c = os.path.join(pdir, "C.jsonl")                                   # A ran /clear: its new file is followed
+            open(c, "w").close()
+            self.assertEqual(T.find(d, "/w/openpi", "A", 0, others={"B"}), c)

@@ -120,6 +120,7 @@ a { color: var(--accent); }
 /* chat */
 .pane-area { flex: 1; min-height: 0; position: relative; }
 .chat { position: absolute; inset: 0; overflow-y: auto; padding: 12px 14px 20px; display: flex; flex-direction: column; gap: 10px; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; }
+.chat > * { flex-shrink: 0; }  /* a column flexbox would otherwise squash long bubbles to a sliver */
 .chat .older { align-self: center; }
 .msg { max-width: 100%; overflow-wrap: anywhere; }
 .msg.user { align-self: flex-end; max-width: 88%; background: var(--accent-soft); border-radius: 14px 14px 4px 14px; padding: 8px 12px; white-space: pre-wrap; }
