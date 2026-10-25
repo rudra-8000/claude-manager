@@ -156,11 +156,17 @@ class ClaudeProc:
     updated_at: float = 0.0
     bridge_session_id: str = ""   # set when Remote Control is on for this session
     kind: str = ""                # "interactive" or "bg" (a Claude Code background session)
+    job_id: str = ""              # set on background jobs
+    parked_job_id: str = ""       # set on an interactive session that handed its conversation to a background job
+    spare: bool = False           # a pre-started idle process Claude Code keeps ready; not a conversation
+    name_source: str = ""         # "user" when you named the session (/rename), "derived"/"auto" when Claude did
 
     def to_dict(self) -> dict:
         return {"pid": self.pid, "session_id": self.session_id, "name": self.name, "cwd": self.cwd,
                 "status": self.status, "version": self.version, "started_at": self.started_at,
                 "updated_at": self.updated_at, "account_dir": self.account_dir, "kind": self.kind,
+                "job_id": self.job_id, "parked_job_id": self.parked_job_id,
+                "label": self.name if self.name and self.name_source not in ("derived", "auto") else "",
                 "in_tmux": bool(self.tmux_pane),
                 "remote_url": f"https://claude.ai/code/{self.bridge_session_id}" if self.bridge_session_id else ""}
 
@@ -183,7 +189,9 @@ def read_registry(accounts: list[Account], check_alive=pid_alive) -> list[Claude
                 started_at=(j.get("startedAt") or 0) / 1000, updated_at=(j.get("statusUpdatedAt") or 0) / 1000,
                 account_dir=acct.dir, tmux_session=m["session"] if m else "", tmux_window=m["window"] if m else "",
                 tmux_pane=m["pane"] if m else "", bridge_session_id=str(j.get("bridgeSessionId") or ""),
-                kind=str(j.get("kind") or ""),
+                kind=str(j.get("kind") or ""), job_id=str(j.get("jobId") or ""),
+                parked_job_id=str(j.get("parkedJobId") or ""), spare=bool(j.get("spare")),
+                name_source=str(j.get("nameSource") or ""),
             ))
     return procs
 

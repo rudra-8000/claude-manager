@@ -41,6 +41,7 @@
       <button data-f="waiting" class="chip">Needs you <b id="n-waiting"></b></button>
       <button data-f="working" class="chip">Working <b id="n-working"></b></button>
       <button data-f="idle" class="chip">Idle</button>
+      <label class="chip check" title="Claude sessions outside tmux (terminal tabs, background jobs): read-only"><input type="checkbox" id="show-external"> outside tmux</label>
       <label class="chip check"><input type="checkbox" id="show-shells"> shells</label>
     </div>
     <div id="sessions" class="scroll-list"></div>
@@ -54,6 +55,7 @@
         <span id="s-title"></span>
         <span id="s-meta" class="sub"></span>
       </div>
+      <a class="btn small" id="job-btn" hidden></a>
       <a class="icon-btn" id="rc-btn" target="_blank" rel="noopener" title="Open in the Claude app (Remote Control is on)" hidden>☁</a>
     </header>
     <div class="tabs" role="tablist">

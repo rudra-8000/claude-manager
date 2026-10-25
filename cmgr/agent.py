@@ -97,10 +97,24 @@ class Agent:
             elif p.dead:
                 d["status"] = "dead"
             out.append(d)
-        matched = {s["claude"]["pid"] for s in out if s["claude"]}
-        for proc in procs:   # live Claude sessions outside tmux: readable (chat), not drivable
-            if proc.pid not in matched:
-                out.append(self._external(proc, procs, by_dir))
+        # Live Claude sessions outside tmux: readable (chat), not drivable. A background job that a tmux
+        # session parked belongs to that session; one running the same conversation as a tmux session is a
+        # duplicate. Both are attached to / hidden behind the tmux session instead of listed on their own.
+        in_tmux = {s["claude"]["pid"]: s for s in out if s["claude"]}
+        parked = {s["claude"]["parked_job_id"]: s for s in in_tmux.values() if s["claude"]["parked_job_id"]}
+        same_conv = {s["claude"]["session_id"]: s for s in in_tmux.values() if s["claude"]["session_id"]}
+        for proc in procs:
+            if proc.pid in in_tmux or proc.spare:
+                continue
+            ext = self._external(proc, procs, by_dir)
+            owner = parked.get(proc.job_id) if proc.job_id else None
+            if owner:
+                ext["parked_by"] = owner["target"]
+                owner.setdefault("bg_jobs", []).append({"target": ext["target"], "status": ext["status"],
+                                                        "preview": ext["preview"]})
+            elif proc.session_id in same_conv:
+                ext["duplicate_of"] = same_conv[proc.session_id]["target"]
+            out.append(ext)
         return out
 
     REGISTRY_STATUS = {"busy": "working", "shell": "working", "idle": "idle"}

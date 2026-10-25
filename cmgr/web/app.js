@@ -15,6 +15,7 @@ const S = {
   state: null,
   filter: "all",
   showShells: store.get("showShells", false),
+  showExternal: store.get("showExternal", false),   // sessions outside tmux are read-only; off by default
   current: null,          // {host, target}
   tab: store.get("tab", "chat"),
   chat: null,             // {key, items, start, end, error, open:Set, folds:Set}
@@ -140,7 +141,8 @@ const STATUS_LABEL = { waiting: "needs you", working: "working", idle: "idle", s
 
 function visibleSessions() {
   const hid = hidden();
-  return allSessions().filter((s) => (s.is_claude || S.showShells) && !(s.account && hid.has(s.account.key)));
+  return allSessions().filter((s) => (s.is_claude || S.showShells) && !(s.account && hid.has(s.account.key))
+    && !(s.external && (s.parked_by || s.duplicate_of || !S.showExternal)));
 }
 function renderSessions() {
   const list = visibleSessions();
@@ -163,9 +165,11 @@ function renderSessions() {
     if (!items.length) { html += `<div class="muted small" style="padding:0 6px">no Claude sessions</div>`; continue; }
     html += items.map((s) => {
       const active = S.current && S.current.host === s.host && S.current.target === s.target;
-      const meta = [shortAcct(s.account), where(s)].filter(Boolean).map(esc).join(" · ");
+      const jobs = (s.bg_jobs || []).length;
+      const title = titleOf(s), folder = sameName(title, s.project) ? "" : s.project;
+      const meta = [folder, shortAcct(s.account), where(s), jobs ? `+${jobs} background job${jobs > 1 ? "s" : ""}` : ""].filter(Boolean).map(esc).join(" · ");
       return `<button class="card${active ? " active" : ""}" data-host="${esc(s.host)}" data-target="${esc(s.target)}">
-        <span class="dot ${esc(s.status)}"></span><span class="title">${esc(s.project || s.session)}</span>
+        <span class="dot ${esc(s.status)}"></span><span class="title">${esc(title)}</span>
         <span class="badge ${esc(s.status)}">${esc(STATUS_LABEL[s.status] || s.status)}</span>
         <span class="meta">${meta}</span>${s.preview ? `<span class="preview">${esc(s.preview)}</span>` : ""}</button>`;
     }).join("");
@@ -391,7 +395,7 @@ function closeSession() {
 function renderSessionHeader() {
   if (!S.current) return;
   const s = findSession(S.current.host, S.current.target);
-  $("#s-title").textContent = s ? (s.project || s.session) : S.current.target;
+  $("#s-title").textContent = s ? titleOf(s) + (sameName(titleOf(s), s.project) ? "" : " · " + s.project) : S.current.target;
   $("#s-meta").textContent = s
     ? [STATUS_LABEL[s.status] || s.status, S.current.host, shortAcct(s.account), where(s)].filter(Boolean).join(" · ")
     : S.current.host + " · " + S.current.target;
@@ -403,17 +407,28 @@ function renderSessionHeader() {
   $("#external-note").hidden = !ext;
   if (ext) {
     const rc = s && s.claude && s.claude.remote_url;
-    $("#external-note").innerHTML = `${s && s.kind === "bg" ? "A Claude Code background session" : "Running in a terminal outside tmux"}, so it can only be read here.
+    const what = s && s.parked_by ? `A background job parked from tmux ${s.parked_by}`
+      : s && s.kind === "bg" ? "A Claude Code background session" : "Running in a terminal outside tmux";
+    $("#external-note").innerHTML = `${what}, so it can only be read here.
       ${rc ? `<a class="btn small primary" href="${esc(rc)}" target="_blank" rel="noopener">☁ Reply in the Claude app</a>`
            : `To prompt it from here, start it inside tmux next time.`}
       ${s && s.decisions_path ? `<button class="btn small" data-act="ext-dec">DECISIONS</button>` : ""}`;
   }
+  // a tmux session's parked background job, and the way back from it
+  const job = s && s.bg_jobs && s.bg_jobs[0];
+  const back = s && (s.parked_by || s.duplicate_of);
+  $("#job-btn").hidden = !(job || back);
+  if (job) { $("#job-btn").textContent = `background job · ${STATUS_LABEL[job.status] || job.status}`; $("#job-btn").href = sessionHash(S.current.host, job.target); }
+  else if (back) { $("#job-btn").textContent = "‹ tmux session"; $("#job-btn").href = sessionHash(S.current.host, back); }
   const rc = s && s.claude && s.claude.remote_url;
   $("#rc-btn").hidden = !rc;
   if (rc) $("#rc-btn").href = rc;
   $("#dec-btn").disabled = !(s && s.decisions_path);
   $("#dec-btn").title = s && s.decisions_path ? s.decisions_path : "No DECISIONS.md found at or above this folder";
 }
+// the name you gave the session (/rename) if any, else the project folder
+const titleOf = (s) => (s.claude && s.claude.label) || s.project || s.session;
+const sameName = (a, b) => String(a).toLowerCase().replace(/[-_ ]/g, "") === String(b).toLowerCase().replace(/[-_ ]/g, "");
 const isExternal = () => !!(S.current && S.current.target.startsWith("proc:"));
 const where = (s) => (s.external ? (s.kind === "bg" ? "background session" : "terminal, not tmux") : "tmux " + s.target);
 function setTab(tab) {
@@ -865,6 +880,8 @@ function bind() {
     $$("#filters [data-f]").forEach((x) => x.classList.toggle("on", x === b));
     renderSessions();
   };
+  $("#show-external").checked = S.showExternal;
+  $("#show-external").onchange = (e) => { S.showExternal = e.target.checked; store.set("showExternal", S.showExternal); renderSessions(); };
   $("#show-shells").checked = S.showShells;
   $("#show-shells").onchange = (e) => { S.showShells = e.target.checked; store.set("showShells", S.showShells); renderSessions(); };
   $("#sessions").onclick = (e) => { const c = e.target.closest(".card[data-target]"); if (c) location.hash = sessionHash(c.dataset.host, c.dataset.target); };

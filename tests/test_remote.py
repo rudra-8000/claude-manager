@@ -239,3 +239,39 @@ class ExternalSessionTests(unittest.TestCase):
             with self.assertRaises(AgentError) as cm:
                 agent.send(s["target"], "hi")
             self.assertEqual(cm.exception.status, 409)
+
+
+class ParkedJobTests(unittest.TestCase):
+    def test_parked_jobs_attach_to_their_tmux_session_and_duplicates_are_marked(self):
+        from cmgr.mux import Pane
+        with tempfile.TemporaryDirectory() as d:
+            acct = os.path.join(d, ".claude")
+            os.makedirs(os.path.join(acct, "sessions"))
+            me = os.getpid()
+            recs = [
+                {"pid": 1, "sessionId": "NEW", "cwd": d, "kind": "interactive", "tmux": "w:@1.%1", "parkedJobId": "JOB1"},
+                {"pid": 2, "sessionId": "OLD", "cwd": d, "kind": "bg", "jobId": "JOB1", "status": "shell"},       # parked from w
+                {"pid": 3, "sessionId": "NEW", "cwd": d, "kind": "bg", "jobId": "JOB2", "status": "idle"},        # same conversation
+                {"pid": 4, "sessionId": "SP", "cwd": d, "kind": "bg", "spare": True, "status": "idle"},           # warm spare
+                {"pid": 5, "sessionId": "LONE", "cwd": d, "kind": "interactive", "status": "idle"},               # terminal tab
+            ]
+            for r in recs:
+                with open(os.path.join(acct, "sessions", f"{r['pid']}.json"), "w") as f:
+                    json.dump(r, f)
+            mux = FakeMux("w")
+            mux.panes = [Pane("w", "@1", 0, "w", "%1", 0, "claude", d, 9, 100, 30, False, True, False)]
+            agent = Agent({"name": "t", "accounts": [{"dir": acct}], "project_roots": [], "tmux": ""}, mux=mux)
+            import cmgr.agent as agent_mod
+            real = agent_mod.read_registry
+            agent_mod.read_registry = lambda accts: real(accts, check_alive=lambda pid: True)
+            try:
+                ss = {s["target"]: s for s in agent.sessions()}
+            finally:
+                agent_mod.read_registry = real
+            self.assertEqual(sorted(ss), ["proc:2", "proc:3", "proc:5", "w:0.0"])      # no spare
+            self.assertEqual(ss["w:0.0"]["bg_jobs"][0]["target"], "proc:2")
+            self.assertEqual(ss["w:0.0"]["bg_jobs"][0]["status"], "working")
+            self.assertEqual(ss["proc:2"]["parked_by"], "w:0.0")
+            self.assertEqual(ss["proc:3"]["duplicate_of"], "w:0.0")
+            self.assertNotIn("parked_by", ss["proc:5"])
+            self.assertNotIn("duplicate_of", ss["proc:5"])
