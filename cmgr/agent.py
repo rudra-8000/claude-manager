@@ -72,13 +72,20 @@ class Agent:
         accounts = self.accounts()
         procs = read_registry(accounts)
         by_dir = {a.dir: a for a in accounts}
+        jobs = {q.job_id: q for q in procs if q.job_id}
         out = []
         for p in panes:
             proc = match_proc(p, procs)
+            # A tmux session that parked its conversation into a background job becomes a live view of that
+            # job: the job is what runs, writes the transcript and answers what is typed into the pane.
+            live = jobs.get(proc.parked_job_id, proc) if proc and proc.parked_job_id else proc
             is_claude = proc is not None or "claude" in p.command.lower()
             d = p.to_dict()
             d["is_claude"] = is_claude
-            d["claude"] = proc.to_dict() if proc else None
+            d["claude"] = live.to_dict() if live else None
+            if live is not proc:
+                d["claude"]["frontend_pid"] = proc.pid
+                d["claude"]["label"] = proc.to_dict()["label"] or d["claude"]["label"]   # your name, not "pi_main (2)"
             acct = by_dir.get(proc.account_dir) if proc else None
             d["account"] = acct.to_dict() if acct else None
             cwd = (proc.cwd if proc else "") or p.cwd
@@ -90,29 +97,24 @@ class Agent:
             if is_claude and not p.dead:
                 try:
                     screen = self.mux.capture(p.target)
-                    d["status"] = screen_status(screen, proc.status if proc else "")
-                    d["preview"] = self._chat_preview(proc, procs) or last_text_line(screen)
+                    reg = "busy" if live and live.status in ("busy", "shell") else (live.status if live else "")
+                    d["status"] = screen_status(screen, reg)
+                    d["preview"] = self._chat_preview(live, procs) or last_text_line(screen)
                 except MuxError:
                     d["status"] = "unknown"
             elif p.dead:
                 d["status"] = "dead"
             out.append(d)
-        # Live Claude sessions outside tmux: readable (chat), not drivable. A background job that a tmux
-        # session parked belongs to that session; one running the same conversation as a tmux session is a
-        # duplicate. Both are attached to / hidden behind the tmux session instead of listed on their own.
-        in_tmux = {s["claude"]["pid"]: s for s in out if s["claude"]}
-        parked = {s["claude"]["parked_job_id"]: s for s in in_tmux.values() if s["claude"]["parked_job_id"]}
-        same_conv = {s["claude"]["session_id"]: s for s in in_tmux.values() if s["claude"]["session_id"]}
+        # Live Claude sessions outside tmux: readable (chat), not drivable. A job shown through a tmux session
+        # (above) or one running the same conversation as a tmux session is not listed again.
+        shown = {s["claude"]["pid"]: s for s in out if s["claude"]}
+        frontends = {s["claude"].get("frontend_pid") for s in shown.values()}
+        same_conv = {s["claude"]["session_id"]: s for s in shown.values() if s["claude"]["session_id"]}
         for proc in procs:
-            if proc.pid in in_tmux or proc.spare:
+            if proc.pid in shown or proc.pid in frontends or proc.spare:
                 continue
             ext = self._external(proc, procs, by_dir)
-            owner = parked.get(proc.job_id) if proc.job_id else None
-            if owner:
-                ext["parked_by"] = owner["target"]
-                owner.setdefault("bg_jobs", []).append({"target": ext["target"], "status": ext["status"],
-                                                        "preview": ext["preview"]})
-            elif proc.session_id in same_conv:
+            if proc.session_id in same_conv:
                 ext["duplicate_of"] = same_conv[proc.session_id]["target"]
             out.append(ext)
         return out
@@ -173,6 +175,8 @@ class Agent:
                 raise AgentError("that Claude session has ended", 404)
         else:
             proc = match_proc(self._check_target(target), procs)
+            if proc and proc.parked_job_id:   # the pane shows its parked job's conversation
+                proc = next((q for q in procs if q.job_id == proc.parked_job_id), proc)
         if not proc:
             raise AgentError("no Claude Code session recorded for this pane", 404)
         path = self._transcript_path(proc, procs)

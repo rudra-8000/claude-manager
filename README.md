@@ -52,8 +52,9 @@ more, and the example peers (`labpc`, `winbox`) in it aren't real.
 ## What it does
 
 - **Which sessions show up:** your tmux/psmux sessions running Claude, found from Claude Code's own session registry
-  (not by scanning folders), titled with the name you gave them. A background job that a tmux session parked is
-  shown on that session ("+1 background job"; its chat is one tap away). Copies of a tmux session's conversation and
+  (not by scanning folders), titled with the name you gave them. When a tmux session has parked its conversation
+  into a Claude Code background job, the tmux pane is a live view of that job, so the page shows the job's chat
+  and status for that session. Copies of a tmux session's conversation and
   Claude Code's idle spare processes are hidden. Sessions in a plain terminal outside tmux appear when you tick
   *outside tmux*: they're read-only (full chat, plus *Reply in the Claude app* when Remote Control is on). Start a
   session inside tmux to prompt it from here.

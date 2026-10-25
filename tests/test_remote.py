@@ -242,36 +242,46 @@ class ExternalSessionTests(unittest.TestCase):
 
 
 class ParkedJobTests(unittest.TestCase):
-    def test_parked_jobs_attach_to_their_tmux_session_and_duplicates_are_marked(self):
+    def test_tmux_session_shows_its_parked_jobs_conversation(self):
         from cmgr.mux import Pane
         with tempfile.TemporaryDirectory() as d:
             acct = os.path.join(d, ".claude")
             os.makedirs(os.path.join(acct, "sessions"))
-            me = os.getpid()
+            pdir = os.path.join(acct, "projects", T.encode_cwd(d))
+            os.makedirs(pdir)
+            with open(os.path.join(pdir, "FRONT.jsonl"), "w", encoding="utf-8") as f:   # stale, from before parking
+                f.write(line(type="assistant", message={"content": [{"type": "text", "text": "old frontend text"}]}) + "\n")
+            with open(os.path.join(pdir, "JOBCONV.jsonl"), "w", encoding="utf-8") as f:  # what the job writes now
+                f.write("\n".join(TRANSCRIPT) + "\n")
             recs = [
-                {"pid": 1, "sessionId": "NEW", "cwd": d, "kind": "interactive", "tmux": "w:@1.%1", "parkedJobId": "JOB1"},
-                {"pid": 2, "sessionId": "OLD", "cwd": d, "kind": "bg", "jobId": "JOB1", "status": "shell"},       # parked from w
-                {"pid": 3, "sessionId": "NEW", "cwd": d, "kind": "bg", "jobId": "JOB2", "status": "idle"},        # same conversation
-                {"pid": 4, "sessionId": "SP", "cwd": d, "kind": "bg", "spare": True, "status": "idle"},           # warm spare
-                {"pid": 5, "sessionId": "LONE", "cwd": d, "kind": "interactive", "status": "idle"},               # terminal tab
+                {"pid": 1, "sessionId": "FRONT", "cwd": d, "kind": "interactive", "tmux": "w:@1.%1", "parkedJobId": "J1", "status": "idle"},
+                {"pid": 2, "sessionId": "JOBCONV", "cwd": d, "kind": "bg", "jobId": "J1", "status": "shell",
+                 "bridgeSessionId": "session_J"},
+                {"pid": 3, "sessionId": "JOBCONV", "cwd": d, "kind": "bg", "jobId": "J2", "status": "idle"},  # copy of it
+                {"pid": 4, "sessionId": "SP", "cwd": d, "kind": "bg", "spare": True, "status": "idle"},        # warm spare
+                {"pid": 5, "sessionId": "LONE", "cwd": d, "kind": "interactive", "status": "idle"},            # terminal tab
             ]
             for r in recs:
                 with open(os.path.join(acct, "sessions", f"{r['pid']}.json"), "w") as f:
                     json.dump(r, f)
             mux = FakeMux("w")
             mux.panes = [Pane("w", "@1", 0, "w", "%1", 0, "claude", d, 9, 100, 30, False, True, False)]
+            mux.capture = lambda target, history=0: "idle screen\n"
             agent = Agent({"name": "t", "accounts": [{"dir": acct}], "project_roots": [], "tmux": ""}, mux=mux)
             import cmgr.agent as agent_mod
             real = agent_mod.read_registry
             agent_mod.read_registry = lambda accts: real(accts, check_alive=lambda pid: True)
             try:
                 ss = {s["target"]: s for s in agent.sessions()}
+                tr = agent.transcript("w:0.0")
             finally:
                 agent_mod.read_registry = real
-            self.assertEqual(sorted(ss), ["proc:2", "proc:3", "proc:5", "w:0.0"])      # no spare
-            self.assertEqual(ss["w:0.0"]["bg_jobs"][0]["target"], "proc:2")
-            self.assertEqual(ss["w:0.0"]["bg_jobs"][0]["status"], "working")
-            self.assertEqual(ss["proc:2"]["parked_by"], "w:0.0")
+            self.assertEqual(sorted(ss), ["proc:3", "proc:5", "w:0.0"])    # job 1 shown through tmux, spare dropped
+            w = ss["w:0.0"]
+            self.assertEqual((w["claude"]["pid"], w["claude"]["frontend_pid"]), (2, 1))
+            self.assertEqual(w["status"], "working")                         # the job is running a command
+            self.assertEqual(w["preview"], "Fixed.")                         # not "old frontend text"
+            self.assertEqual(w["claude"]["remote_url"], "https://claude.ai/code/session_J")
+            self.assertTrue(tr["path"].endswith("JOBCONV.jsonl"))
             self.assertEqual(ss["proc:3"]["duplicate_of"], "w:0.0")
-            self.assertNotIn("parked_by", ss["proc:5"])
             self.assertNotIn("duplicate_of", ss["proc:5"])
