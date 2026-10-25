@@ -76,8 +76,13 @@ another), is recognised by its account id and shown once in the usage panel, lab
 On **every** machine (clone or copy this folder there first):
 
 ```bash
-pip install -e .            # gives you the `cm` command; or use `python -m cmgr ...` without installing
+git clone https://github.com/rudra-8000/claude-manager && cd claude-manager
+pipx install -e .           # Ubuntu (24.04 blocks plain `pip install` into the system Python)
+pip install -e .            # Windows
 ```
+
+Nothing has to be installed at all: it's standard library only, so `python3 -m cmgr <command>` from the clone
+does the same as `cm <command>`.
 
 On the machine that will host the web UI (any always-on one; it is also an agent):
 
