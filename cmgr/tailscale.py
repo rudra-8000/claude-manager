@@ -73,6 +73,19 @@ class Tailscale:
         me = self.status()["self"]
         return me["user_id"] if me else None
 
+    def my_devices(self) -> list[dict]:
+        """All computers of my Tailscale user, online or not (phones and shared-in machines excluded),
+        named by their MagicDNS label, which is unique in the tailnet unlike the hostname."""
+        st = self.status()
+        if not st["running"]:
+            return []
+        uid = st["self"]["user_id"]
+        out = []
+        for p in st["peers"]:
+            if p["user_id"] == uid and p["os"] not in PHONE_OS:
+                out.append({**p, "label": (p["dns"].split(".")[0] if p["dns"] else p["name"]) or p["ip"]})
+        return sorted(out, key=lambda p: p["label"])
+
     def my_machines(self) -> list[dict]:
         """Online peers owned by the same Tailscale user (shared-in machines of other people excluded), no phones."""
         st = self.status()

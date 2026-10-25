@@ -18,8 +18,8 @@
 <div id="login" class="login" hidden>
   <form id="login-form" class="login-card">
     <h1>Claude Manager</h1>
-    <p>Devices of your own Tailscale account get in without this. From anywhere else, paste the token from
-       <code>~/.claude-manager/config.json</code>.</p>
+    <p id="login-msg">Devices of your own Tailscale account get in without a token. From anywhere else, paste the
+       token from <code>~/.claude-manager/config.json</code>.</p>
     <input id="login-token" type="password" autocomplete="current-password" placeholder="token" required>
     <button class="btn primary" type="submit">Connect</button>
     <p id="login-error" class="error" hidden></p>
@@ -27,89 +27,107 @@
 </div>
 
 <div id="app" class="app" hidden>
-  <aside id="side" class="side" aria-label="Accounts and machines">
-    <div class="side-head">
-      <span class="side-title">Usage</span>
-      <button class="icon-btn" id="side-close" aria-label="Close panel">✕</button>
+  <!-- left: sessions -->
+  <section id="list-view" class="col list-col">
+    <header class="topbar">
+      <div class="topbar-title">Sessions <span id="sync-dot" class="sync-dot" title="last refresh"></span></div>
+      <button class="icon-btn" id="devices-btn" title="Devices &amp; accounts" aria-label="Devices and accounts">⚙</button>
+      <button class="icon-btn" id="projects-btn" title="Projects &amp; DECISIONS.md" aria-label="Projects">▤</button>
+      <button class="icon-btn" id="usage-btn" title="Usage" aria-label="Usage">◔</button>
+      <button class="icon-btn accent" id="new-btn" title="New session" aria-label="New session">＋</button>
+    </header>
+    <div class="filters" id="filters">
+      <button data-f="all" class="chip on">All</button>
+      <button data-f="waiting" class="chip">Needs you <b id="n-waiting"></b></button>
+      <button data-f="working" class="chip">Working <b id="n-working"></b></button>
+      <button data-f="idle" class="chip">Idle</button>
+      <label class="chip check"><input type="checkbox" id="show-shells"> shells</label>
     </div>
-    <div id="accounts" class="accounts"></div>
-    <div class="side-head"><span class="side-title">Machines</span></div>
-    <div id="hosts" class="hosts"></div>
+    <div id="sessions" class="scroll-list"></div>
+  </section>
+
+  <!-- middle: one session -->
+  <section id="session-view" class="col session-col" hidden>
+    <header class="topbar">
+      <button class="icon-btn" id="back-btn" aria-label="Back">‹</button>
+      <div class="topbar-title stack">
+        <span id="s-title"></span>
+        <span id="s-meta" class="sub"></span>
+      </div>
+      <a class="icon-btn" id="rc-btn" target="_blank" rel="noopener" title="Open in the Claude app (Remote Control is on)" hidden>☁</a>
+    </header>
+    <div class="tabs" role="tablist">
+      <button class="tab on" data-tab="chat" role="tab">Chat</button>
+      <button class="tab" data-tab="screen" role="tab">Screen</button>
+      <span class="tab-tools" id="screen-tools" hidden>
+        <button class="icon-btn small" id="fit-btn" title="Wrap / fit-to-width">↔</button>
+        <button class="icon-btn small" id="font-down" title="Smaller">A-</button>
+        <button class="icon-btn small" id="font-up" title="Larger">A+</button>
+      </span>
+    </div>
+
+    <div class="pane-area">
+      <div id="chat" class="chat"></div>
+      <div id="term-wrap" class="term-wrap" hidden>
+        <div id="term" class="term"></div>
+      </div>
+      <button id="jump-btn" class="jump" hidden>↓ latest</button>
+    </div>
+
+    <div id="waiting-card" class="waiting-card" hidden>
+      <div class="waiting-head">Claude is waiting for you</div>
+      <div id="waiting-screen" class="waiting-screen"></div>
+    </div>
+    <div class="keybar" id="keybar">
+      <button data-k="1">1</button>
+      <button data-k="2">2</button>
+      <button data-k="3">3</button>
+      <button data-k="Escape">Esc</button>
+      <button data-k="Enter">⏎</button>
+      <button data-k="Up">↑</button>
+      <button data-k="Down">↓</button>
+      <button data-k="Tab">Tab</button>
+      <button data-k="BTab" title="Shift+Tab: cycle mode">⇧Tab</button>
+      <button data-k="BSpace">⌫</button>
+      <button data-k="C-c" class="warn">^C</button>
+    </div>
+    <form id="composer" class="composer">
+      <textarea id="prompt" rows="1" placeholder="Prompt this session…" enterkeyhint="enter"></textarea>
+      <div class="composer-row">
+        <button type="button" class="btn small" id="dec-btn">DECISIONS</button>
+        <label class="tiny-check"><input type="checkbox" id="no-submit"> paste only</label>
+        <span id="prompt-count" class="muted small"></span>
+        <button type="submit" class="btn primary" id="send-btn">Send</button>
+      </div>
+    </form>
+  </section>
+
+  <!-- middle alternative: projects -->
+  <section id="projects-view" class="col session-col" hidden>
+    <header class="topbar">
+      <button class="icon-btn" id="projects-back" aria-label="Back">‹</button>
+      <div class="topbar-title">Projects</div>
+    </header>
+    <div id="projects" class="scroll-list"></div>
+  </section>
+
+  <div id="empty-view" class="col session-col empty-col">
+    <div class="empty">Pick a session on the left.</div>
+  </div>
+
+  <!-- right: usage -->
+  <aside id="usage-panel" class="col usage-col" aria-label="Usage">
+    <header class="topbar">
+      <div class="topbar-title">Usage</div>
+      <button class="icon-btn" id="usage-close" aria-label="Hide usage">✕</button>
+    </header>
+    <div id="accounts" class="scroll-list accounts"></div>
     <div class="side-foot">
       <button class="btn small ghost" id="notify-btn">Enable notifications</button>
-      <button class="btn small ghost" id="logout-btn">Forget token</button>
+      <button class="btn small ghost" id="logout-btn" hidden>Forget token</button>
     </div>
   </aside>
   <div id="scrim" class="scrim"></div>
-
-  <div class="main">
-    <section id="list-view" class="list-view">
-      <header class="topbar">
-        <button class="icon-btn" id="side-toggle" aria-label="Usage panel">☰</button>
-        <div class="topbar-title">Sessions <span id="sync-dot" class="sync-dot" title="last refresh"></span></div>
-        <button class="icon-btn" id="projects-btn" aria-label="Projects" title="Projects &amp; DECISIONS.md">▤</button>
-        <button class="icon-btn accent" id="new-btn" aria-label="New session" title="New session">＋</button>
-      </header>
-      <div class="filters" id="filters">
-        <button data-f="all" class="chip on">All</button>
-        <button data-f="waiting" class="chip">Needs you <b id="n-waiting"></b></button>
-        <button data-f="working" class="chip">Working <b id="n-working"></b></button>
-        <button data-f="idle" class="chip">Idle</button>
-        <label class="chip check"><input type="checkbox" id="show-shells"> shells</label>
-      </div>
-      <div id="sessions" class="sessions"></div>
-    </section>
-
-    <section id="session-view" class="session-view" hidden>
-      <header class="topbar">
-        <button class="icon-btn" id="back-btn" aria-label="Back">‹</button>
-        <div class="topbar-title stack">
-          <span id="s-title"></span>
-          <span id="s-meta" class="sub"></span>
-        </div>
-        <a class="icon-btn" id="rc-btn" target="_blank" rel="noopener" title="Open in the Claude app (Remote Control is on for this session)" hidden>☁</a>
-        <button class="icon-btn" id="fit-btn" title="Wrap / fit-to-width">↔</button>
-        <button class="icon-btn" id="font-down" title="Smaller text">A-</button>
-        <button class="icon-btn" id="font-up" title="Larger text">A+</button>
-      </header>
-      <div id="term-wrap" class="term-wrap">
-        <div id="term" class="term"></div>
-        <button id="jump-btn" class="jump" hidden>↓ latest</button>
-      </div>
-      <div class="keybar" id="keybar">
-        <button data-k="Escape">Esc</button>
-        <button data-k="Enter">⏎</button>
-        <button data-k="Up">↑</button>
-        <button data-k="Down">↓</button>
-        <button data-k="Tab">Tab</button>
-        <button data-k="BTab" title="Shift+Tab: cycle mode">⇧Tab</button>
-        <button data-k="1">1</button>
-        <button data-k="2">2</button>
-        <button data-k="3">3</button>
-        <button data-k="BSpace">⌫</button>
-        <button data-k="Left">←</button>
-        <button data-k="Right">→</button>
-        <button data-k="C-c" class="warn">^C</button>
-      </div>
-      <form id="composer" class="composer">
-        <textarea id="prompt" rows="1" placeholder="Prompt this session…" enterkeyhint="enter"></textarea>
-        <div class="composer-row">
-          <button type="button" class="btn small" id="dec-btn">DECISIONS</button>
-          <label class="tiny-check"><input type="checkbox" id="no-submit"> paste only</label>
-          <span id="prompt-count" class="muted small"></span>
-          <button type="submit" class="btn primary" id="send-btn">Send</button>
-        </div>
-      </form>
-    </section>
-
-    <section id="projects-view" class="list-view" hidden>
-      <header class="topbar">
-        <button class="icon-btn" id="projects-back" aria-label="Back">‹</button>
-        <div class="topbar-title">Projects</div>
-      </header>
-      <div id="projects" class="sessions"></div>
-    </section>
-  </div>
 </div>
 
 <div id="dec-sheet" class="sheet" hidden>
@@ -145,6 +163,23 @@
   </div>
 </div>
 
+<div id="devices-sheet" class="sheet" hidden>
+  <div class="sheet-card" role="dialog" aria-modal="true" aria-labelledby="devices-title">
+    <header class="sheet-head">
+      <strong id="devices-title">Devices &amp; accounts</strong>
+      <button class="icon-btn" id="devices-close" aria-label="Close">✕</button>
+    </header>
+    <div class="sheet-body">
+      <h3 class="sec-title">Devices</h3>
+      <p class="muted small" id="devices-hint"></p>
+      <div id="devices-list"></div>
+      <h3 class="sec-title">Accounts</h3>
+      <p class="muted small">Switch an account off to hide its sessions. Its usage stays on the right.</p>
+      <div id="accounts-list"></div>
+    </div>
+  </div>
+</div>
+
 <div id="new-sheet" class="sheet" hidden>
   <form id="new-form" class="sheet-card small" role="dialog" aria-modal="true" aria-labelledby="new-title">
     <header class="sheet-head">
@@ -152,7 +187,7 @@
       <button type="button" class="icon-btn" id="new-close" aria-label="Close">✕</button>
     </header>
     <div class="form">
-      <label>Machine <select id="new-host"></select></label>
+      <label>Device <select id="new-host"></select></label>
       <label>Account <select id="new-account"></select></label>
       <label>Folder
         <input id="new-cwd" list="new-cwd-list" placeholder="/home/me/project or C:\path" required>

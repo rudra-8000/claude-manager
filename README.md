@@ -9,52 +9,68 @@ entries into a prompt or copy them for the project's Perplexity thread.
 types into them, reads files Claude Code already keeps on disk, and asks Anthropic's usage
 endpoint (the same one `/usage` uses) for your limits. The only tokens spent are the prompts you send.
 
-## Setup (per machine, no configuration)
+## Setup: one machine runs it, the rest are reached over SSH
+
+On the machine that will host the page (an always-on one, e.g. `computenode-01`):
 
 ```bash
 git clone https://github.com/rudra-8000/claude-manager && cd claude-manager
-pipx install -e .        # Ubuntu (24.04 blocks plain pip into the system Python)
-pip install -e .         # Windows
+pipx install -e .        # Ubuntu (24.04 blocks plain pip into the system Python); on Windows: pip install -e .
 cm up                    # starts it in a detached tmux/psmux session called "cm" and prints its address
 ```
 
-Do that on every machine, then open any machine's address (for example
-`http://computenode-01.<tailnet>.ts.net:8765`) on your phone or laptop with Tailscale on. Every page
-shows all machines, so it doesn't matter which one you open. Add it to your phone's home screen.
+Open that address on your phone or laptop with Tailscale on (for example
+`http://computenode-01.<tailnet>.ts.net:8765`) and add it to your home screen.
 
-- **Other machines** are found through Tailscale: every online computer of *your* Tailscale user that runs
-  `cm` shows up. Machines shared into your tailnet by other people are ignored.
-- **Who can connect:** only your own Tailscale devices, checked with `tailscale whois`. No token is needed.
-- **Accounts** are found automatically: `~/.claude`, `~/.claude-*`, and any config dir your shell aliases or
-  functions point at. Your alias names (`claude-b`, `claude-rudra`) become the labels.
-- **Projects** are the folders you have used Claude Code in, taken from Claude Code's own history, newest
-  first. You don't list them anywhere.
+**Add your other machines** in ⚙ *Devices & accounts*. Every computer on your Tailscale account is listed
+there (phones and machines shared in by other people are left out). For each one:
 
-Updating: `git pull && cm up --restart`. Stopping: `cm down`. Checking: `cm doctor` (shows accounts, live usage,
-sessions, and which of your other machines are reachable).
+- **Over SSH (nothing to install there):** tap *Set up SSH*, enter how the hub machine reaches it
+  (`user@guru`), and if needed the Python to use (`python3`, or a full path on Windows). The hub opens
+  `ssh` to it, streams its own code over that connection and runs it in memory. The only requirement is
+  that `ssh user@guru` works **from the hub machine** without a password prompt (check with
+  `ssh user@guru true` there; if it asks for a password, run `ssh-copy-id user@guru` once). Python 3.9+ and
+  tmux must be on the other machine, which they already are wherever you run Claude Code in tmux.
+- **Or run `cm up` on it too:** a machine that runs `cm` is picked up automatically, no SSH needed. This is the
+  easy option for Windows, where SSH into psmux needs the Windows OpenSSH server set up.
 
-If you configured an earlier version with `cm init`, delete `~/.claude-manager/config.json`; it isn't needed
-any more, and the example peers (`labpc`, `winbox`) in it aren't real.
+Switch devices on and off to choose whose sessions you see. In the same panel, switch accounts off to hide their
+sessions. Usage stays visible on the right either way.
+
+- **Who can connect to the page:** only your own Tailscale devices, checked with `tailscale whois`. No token.
+- **Accounts** are found automatically on every machine: `~/.claude`, `~/.claude-*`, and any config dir your shell
+  aliases or functions point at. Your alias names (`claude-b`, `claude-rudra`) become the labels.
+- **Projects** are the folders you have used Claude Code in, from Claude Code's own history, newest first.
+
+Updating: `git pull && cm up --restart` on the hub. SSH machines get the new code on the next connection. Stopping:
+`cm down`. Checking: `cm doctor`.
+
+If you configured an earlier version with `cm init`, delete `~/.claude-manager/config.json`; it isn't needed any
+more, and the example peers (`labpc`, `winbox`) in it aren't real.
 
 ## What it does
 
-- **Sessions list:** every Claude Code pane on every machine, with its status (needs you / working /
-  idle), project, account, tmux target, and the last line of output. "Needs you" means a permission
-  prompt, a question or a "trust this folder?" dialog is on screen. Alerts fire when a session starts
-  waiting for you or finishes.
-- **Session view:** a live, colour copy of the pane (fit-to-width or wrapped for phones) and a prompt box.
-  Multi-line prompts are pasted as one block, so they don't submit at the first newline. "Paste only" puts
-  the text in Claude's input without pressing Enter. A key bar has Esc, Enter, arrows, Tab, Shift+Tab, 1/2/3,
-  Backspace and Ctrl+C. If Remote Control is on for that session, a ☁ button opens it in the Claude app.
-- **New session:** pick a machine, an account (by alias) and a folder (from your Claude history or typed). It
-  starts a detached tmux session with a normal shell, so the pane survives `/exit`, and runs `claude` (optionally
+- **Sessions list:** grouped by device. Each session shows its status (needs you / working / idle), project,
+  account and last line. "Needs you" means a permission prompt, a question or a "trust this folder?" dialog is
+  on screen. Alerts fire when a session starts waiting for you or finishes.
+- **Chat tab:** the whole conversation, read from Claude Code's own transcript file. It scrolls, with
+  *Load earlier messages* for older history. Claude's replies are rendered as formatted text, and each tool call
+  is a line you can tap to see its result (long runs of tool calls are folded). The tmux screen can't give you
+  this: Claude Code draws in tmux's alternate screen, so tmux keeps no scrollback.
+- **Screen tab:** the live terminal, for menus and anything the chat doesn't show. When Claude is waiting for an
+  answer, the chat shows the prompt in a "waiting for you" card, with keys 1/2/3/Esc/Enter right below.
+- **Prompt box:** multi-line prompts are pasted as one block, so they don't submit at the first newline. "Paste
+  only" puts the text in Claude's input without pressing Enter. If Remote Control is on for the session, ☁ opens
+  it in the Claude app.
+- **New session:** pick a device, an account (by alias) and a folder (from your Claude history or typed). It starts
+  a detached tmux session with a normal shell, so the pane survives `/exit`, and runs `claude` (optionally
   `--continue`) with the right `CLAUDE_CONFIG_DIR`.
-- **Usage panel** (collapsible): per account, the 5-hour and weekly bars with reset times. The same login
-  on several machines, even under different alias names, is shown once.
-- **DECISIONS.md:** found at or above the session's folder (`DECISIONS.md` or `decisions.md`). Entries are
-  the `## ` headings, newest first, showing id, date, short title, tags and a ≈token estimate. You can pick
-  "latest N" or tick entries one by one, read any entry in full, then **Insert** it into the prompt, **Copy**
-  it, or **Copy + Perplexity**, which copies it and opens that project's saved thread.
+- **Usage** (right column, collapsible; a drawer on phones): per account, the 5-hour and weekly bars with reset
+  times. The same login on several machines, even under different alias names, is shown once.
+- **DECISIONS.md:** found at or above the session's folder (`DECISIONS.md` or `decisions.md`). Entries are the `## `
+  headings, newest first, showing id, date, short title, tags and a ≈token estimate. Pick "latest N" or tick entries
+  one by one, read any entry in full, then **Insert** it into the prompt, **Copy** it, or **Copy + Perplexity**, which
+  copies it and opens that project's saved thread.
 
 Your sessions are not changed in any way: they stay ordinary interactive `claude` in tmux, and you can
 still `ssh` + `tmux attach` the old way. Nothing is installed into Claude Code's settings.
@@ -106,6 +122,13 @@ from localhost.
 - **Reading and typing:** `tmux capture-pane -p -e` about once a second for the open session; prompts go through
   `load-buffer` + `paste-buffer -p` (bracketed paste) + `send-keys Enter`. There is no terminal attach, so your
   desktop's pane size never changes.
+- **Chat:** `<config dir>/projects/<cwd with non-alphanumerics as '-'>/<sessionId>.jsonl`, the transcript Claude Code
+  writes. Only byte ranges are read (the tail, then older chunks on request, then whatever was appended), so even
+  a 150 MB transcript loads in ~20 ms. After `/clear` the newest file in that folder is followed.
+- **SSH devices:** `ssh -T -o BatchMode=yes <target> python3 -u -c "exec(input())"`; the first stdin line installs
+  an in-memory importer, the second carries this package's source, then requests and answers are JSON lines. Two
+  connections per device, so a slow refresh never blocks the open session. If ssh fails, its own error message is
+  shown on the device.
 - **Which account a pane uses:** Claude Code writes `<config dir>/sessions/<pid>.json` with the tmux pane it runs in
   (and the Remote Control session id when that is on). The manager matches those files to `tmux list-panes`.
 - **Status:** read from the screen: a numbered choice, "Do you want to…" or "Enter to confirm" means it needs you;
@@ -122,7 +145,7 @@ from localhost.
 ## Development
 
 ```bash
-python -m pytest -q tests      # 41 tests
+python -m pytest -q tests      # 50 tests
 ```
 
 Architecture decisions are recorded in [DECISIONS.md](DECISIONS.md).

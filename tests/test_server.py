@@ -31,6 +31,9 @@ class FakeTS:
     def my_machines(self):
         return self.machines
 
+    def my_devices(self):
+        return [{"label": m["name"], "online": True, "os": "linux", **m} for m in self.machines]
+
     def owner_of(self, ip):
         return self.owners.get(ip)
 

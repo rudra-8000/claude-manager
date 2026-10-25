@@ -1,5 +1,5 @@
 "use strict";
-// Claude Manager web UI. Plain JS, no build step. Everything goes through /hub/* on this machine.
+// Claude Manager web UI. Plain JS, no build step. Everything goes through /hub/* on the hub machine.
 
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
@@ -12,16 +12,18 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "
 
 const S = {
   token: store.get("token", ""),
-  state: null,          // last /hub/state
+  state: null,
   filter: "all",
   showShells: store.get("showShells", false),
-  current: null,        // {host, target}
+  current: null,          // {host, target}
+  tab: store.get("tab", "chat"),
+  chat: null,             // {key, items, start, end, error, open:Set, folds:Set}
+  pane: null,             // last /pane result
   paneHash: "",
-  lastPane: null,
   prevStatus: new Map(),
   projects: null,
-  dec: null,            // decisions sheet state
-  termMode: store.get("termMode", "auto"),   // auto | fit | wrap
+  dec: null,
+  termMode: store.get("termMode", "auto"),
   wrapFont: store.get("wrapFont", 12.5),
   fastUntil: 0,
 };
@@ -30,17 +32,16 @@ const S = {
 class ApiError extends Error { constructor(msg, status) { super(msg); this.status = status; } }
 async function api(method, path, params, body) {
   const qs = params ? "?" + new URLSearchParams(params).toString() : "";
-  const res = await fetch(path + qs, {
-    method, headers: { Authorization: "Bearer " + S.token, "Content-Type": "application/json" },
-    body: body ? JSON.stringify(body) : undefined, cache: "no-store",
-  });
+  const headers = { "Content-Type": "application/json" };
+  if (S.token) headers.Authorization = "Bearer " + S.token;
+  const res = await fetch(path + qs, { method, headers, body: body ? JSON.stringify(body) : undefined, cache: "no-store" });
   let data = null;
   try { data = await res.json(); } catch {}
   if (!res.ok) throw new ApiError((data && data.error) || "HTTP " + res.status, res.status);
   return data;
 }
 
-// ------------------------------------------------------------------ toasts / clipboard / time
+// ------------------------------------------------------------------ small helpers
 function toast(msg, opts = {}) {
   const el = document.createElement("div");
   el.className = "toast" + (opts.err ? " err" : "");
@@ -49,7 +50,6 @@ function toast(msg, opts = {}) {
   $("#toasts").appendChild(el);
   setTimeout(() => el.remove(), opts.ms || 3500);
 }
-
 function copyFallback(text) {
   const ta = document.createElement("textarea");
   ta.value = text; ta.setAttribute("readonly", "");
@@ -63,12 +63,9 @@ function copyFallback(text) {
 }
 // Starts the copy synchronously inside the tap handler (iOS needs that), resolves to success.
 function copyText(text) {
-  if (navigator.clipboard && window.isSecureContext) {
-    return navigator.clipboard.writeText(text).then(() => true, () => copyFallback(text));
-  }
+  if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(text).then(() => true, () => copyFallback(text));
   return Promise.resolve(copyFallback(text));
 }
-
 function rel(ts) {
   const d = ts - Date.now() / 1000, a = Math.abs(d);
   let s;
@@ -86,18 +83,25 @@ function clock(ts) {
 }
 const fmtTokens = (n) => (n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + "k" : String(n));
 const shortAcct = (a) => (a ? a.label || (a.email || "").split("@")[0] : "");
+const atBottom = (el) => el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+const hidden = () => new Set((S.state && S.state.hidden_accounts) || []);
 
 // ------------------------------------------------------------------ routing
 function route() {
   const h = location.hash || "#/";
   const m = h.match(/^#\/s\/([^/]+)\/(.+)$/);
+  const app = $("#app");
   $("#projects-view").hidden = h !== "#/projects";
-  $("#list-view").hidden = h === "#/projects";
   if (m) {
+    $("#empty-view").hidden = true;
+    app.classList.add("mid-open");
     openSession(decodeURIComponent(m[1]), decodeURIComponent(m[2]));
   } else {
     closeSession();
-    if (h === "#/projects") loadProjects();
+    const proj = h === "#/projects";
+    app.classList.toggle("mid-open", proj);
+    $("#empty-view").hidden = proj;
+    if (proj) loadProjects();
   }
 }
 const sessionHash = (host, target) => "#/s/" + encodeURIComponent(host) + "/" + encodeURIComponent(target);
@@ -110,69 +114,69 @@ async function refreshState() {
   try {
     S.state = await api("GET", "/hub/state");
     $("#sync-dot").className = "sync-dot ok";
-    renderSide();
-    renderSessions();
-    notifyTransitions();
+    renderUsage(); renderSessions(); notifyTransitions();
+    if (!$("#devices-sheet").hidden) renderDevices();
     if (S.current) renderSessionHeader();
   } catch (e) {
     $("#sync-dot").className = "sync-dot bad";
-    if (e.status === 401) return showLogin("Token rejected.");
-  } finally {
-    stateBusy = false;
-  }
+    if (e.status === 401) showLogin(e.message);
+  } finally { stateBusy = false; }
 }
 function scheduleState() {
   clearTimeout(stateTimer);
-  stateTimer = setTimeout(async () => { if (!document.hidden) await refreshState(); scheduleState(); }, S.current ? 8000 : 4000);
+  stateTimer = setTimeout(async () => { if (!document.hidden) await refreshState(); scheduleState(); }, S.current ? 6000 : 4000);
 }
-
 function allSessions() {
   const out = [];
   for (const h of (S.state && S.state.hosts) || []) {
-    for (const s of h.sessions || []) {
-      out.push({ ...s, host: h.name, status: h.ok ? s.status : "offline", hostOk: h.ok });
-    }
+    for (const s of h.sessions || []) out.push({ ...s, host: h.name, status: h.ok ? s.status : "offline", hostOk: h.ok });
   }
   return out;
 }
+function findSession(host, target) { return allSessions().find((s) => s.host === host && s.target === target); }
 const ORDER = { waiting: 0, working: 1, idle: 2, unknown: 3, offline: 4, shell: 5, dead: 6 };
 const STATUS_LABEL = { waiting: "needs you", working: "working", idle: "idle", shell: "shell", offline: "offline", dead: "exited", unknown: "?" };
 
+function visibleSessions() {
+  const hid = hidden();
+  return allSessions().filter((s) => (s.is_claude || S.showShells) && !(s.account && hid.has(s.account.key)));
+}
 function renderSessions() {
-  const list = allSessions().filter((s) => s.is_claude || S.showShells);
+  const list = visibleSessions();
   const counts = { waiting: 0, working: 0 };
   list.forEach((s) => { if (s.status in counts) counts[s.status]++; });
   $("#n-waiting").textContent = counts.waiting || "";
   $("#n-working").textContent = counts.working || "";
   document.title = (counts.waiting ? `(${counts.waiting}) ` : "") + "Claude Manager";
-
-  const shown = list
-    .filter((s) => S.filter === "all" || s.status === S.filter)
-    .sort((a, b) => (ORDER[a.status] ?? 9) - (ORDER[b.status] ?? 9) || a.host.localeCompare(b.host) || a.project.localeCompare(b.project));
   const box = $("#sessions");
-  if (!shown.length) {
-    const nHosts = ((S.state && S.state.hosts) || []).length;
-    box.innerHTML = `<div class="empty">${list.length ? "Nothing in this filter." : `No Claude sessions in tmux on ${nHosts} machine${nHosts === 1 ? "" : "s"}.<br>Tap ＋ to start one.`}</div>`;
-    return;
+  const hosts = (S.state && S.state.hosts) || [];
+  const groups = hosts.map((h) => ({ h, items: list.filter((s) => s.host === h.name && (S.filter === "all" || s.status === S.filter))
+    .sort((a, b) => (ORDER[a.status] ?? 9) - (ORDER[b.status] ?? 9) || a.project.localeCompare(b.project)) }));
+  const devs = (S.state && S.state.devices) || [];
+  const off = devs.some((d) => d.enabled && d.status !== "this machine") ? 0
+    : devs.filter((d) => !d.enabled && d.online && d.status !== "this machine").length;
+  let html = "";
+  for (const { h, items } of groups) {
+    if (!items.length && S.filter !== "all") continue;
+    html += `<div class="group-label"><span class="dot ${h.ok ? "on" : ""}"></span>${esc(h.name)}${h.ok ? "" : ` · <span class="error">${esc(h.error || "offline")}</span>`}</div>`;
+    if (!items.length) { html += `<div class="muted small" style="padding:0 6px">no Claude sessions</div>`; continue; }
+    html += items.map((s) => {
+      const active = S.current && S.current.host === s.host && S.current.target === s.target;
+      const meta = [shortAcct(s.account), "tmux " + s.target].filter(Boolean).map(esc).join(" · ");
+      return `<button class="card${active ? " active" : ""}" data-host="${esc(s.host)}" data-target="${esc(s.target)}">
+        <span class="dot ${esc(s.status)}"></span><span class="title">${esc(s.project || s.session)}</span>
+        <span class="badge ${esc(s.status)}">${esc(STATUS_LABEL[s.status] || s.status)}</span>
+        <span class="meta">${meta}</span>${s.preview ? `<span class="preview">${esc(s.preview)}</span>` : ""}</button>`;
+    }).join("");
   }
-  box.innerHTML = shown.map((s) => {
-    const active = S.current && S.current.host === s.host && S.current.target === s.target;
-    const acct = shortAcct(s.account);
-    const meta = [s.host, acct, "tmux " + s.target].filter(Boolean).map(esc).join(" · ");
-    return `<button class="card${active ? " active" : ""}" data-host="${esc(s.host)}" data-target="${esc(s.target)}">
-      <span class="dot ${esc(s.status)}"></span>
-      <span class="title">${esc(s.project || s.session)}</span>
-      <span class="badge ${esc(s.status)}">${esc(STATUS_LABEL[s.status] || s.status)}</span>
-      <span class="meta">${meta}</span>
-      ${s.preview ? `<span class="preview">${esc(s.preview)}</span>` : ""}
-    </button>`;
-  }).join("");
+  if (off) html += `<div class="muted small" style="padding:10px 6px">Only this machine is shown. Tap ⚙ to add your other devices (${off} online).</div>`;
+  box.innerHTML = html || `<div class="empty">No sessions.</div>`;
 }
 
-function renderSide() {
+function renderUsage() {
   const st = S.state;
   if (!st) return;
-  const now = Date.now() / 1000;
+  const hid = hidden();
   $("#accounts").innerHTML = st.accounts.length ? st.accounts.map((u) => {
     const a = u.account;
     const limits = (u.limits || []).map((l) => {
@@ -180,30 +184,20 @@ function renderSide() {
       const cls = l.severity === "critical" || p >= 90 ? "danger" : l.severity === "warning" || p >= 70 ? "warn" : "";
       const reset = l.resets_at ? `resets ${rel(Date.parse(l.resets_at) / 1000)} · ${clock(Date.parse(l.resets_at) / 1000)}` : "not started";
       return `<div class="limit"><div class="limit-top"><span>${esc(l.label)}</span><b>${p == null ? "–" : p + "%"}</b></div>
-        <div class="bar ${cls}"><i style="width:${Math.min(100, Math.max(0, p || 0))}%"></i></div>
-        <div class="limit-reset">${esc(reset)}</div></div>`;
+        <div class="bar ${cls}"><i style="width:${Math.min(100, Math.max(0, p || 0))}%"></i></div><div class="limit-reset">${esc(reset)}</div></div>`;
     }).join("");
     const notes = [];
     if (u.error) notes.push(`<div class="note err">${esc(u.error)}</div>`);
     if (u.fetched_at) notes.push(`<div class="note">updated ${esc(rel(u.fetched_at))}${u.stale ? " (stale)" : ""} · on ${esc(u.hosts.join(", "))}</div>`);
     else if (!u.error) notes.push(`<div class="note">fetching…</div>`);
-    return `<div class="acct"><div class="acct-head"><span class="stack"><span class="acct-name" title="${esc(a.dir)}">${esc(a.label)}</span>
-      <span class="sub">${esc(a.email || "")}</span></span>
-      <span class="badge">${esc(a.subscription || "")}</span></div>${limits}${notes.join("")}</div>`;
+    return `<div class="acct${hid.has(a.key) ? " dim" : ""}"><div class="acct-head"><span class="stack"><span class="acct-name" title="${esc(a.dir)}">${esc(a.label)}</span>
+      <span class="sub">${esc(a.email || "")}</span></span><span class="badge">${esc(a.subscription || "")}</span></div>${limits}${notes.join("")}</div>`;
   }).join("") : `<div class="empty">No logged-in accounts found.</div>`;
-
-  $("#hosts").innerHTML = st.hosts.map((h) => {
-    const n = (h.sessions || []).filter((s) => s.is_claude).length;
-    const os = h.info ? (h.info.platform === "win32" ? "Windows" : h.info.platform) : "";
-    return `<div class="host-row"><span class="dot ${h.ok ? "idle" : "offline"}"></span>
-      <span class="grow"><b>${esc(h.name)}</b> <span class="muted small">${esc(os)} · ${n} session${n === 1 ? "" : "s"}${h.ok ? " · " + h.latency_ms + " ms" : ""}</span>
-      ${h.ok ? "" : `<br><span class="error">${esc(h.error)}${h.seen_at ? " · last seen " + esc(rel(h.seen_at)) : ""}</span>`}</span></div>`;
-  }).join("");
 }
 
 function notifyTransitions() {
   const seen = new Set();
-  for (const s of allSessions()) {
+  for (const s of visibleSessions()) {
     if (!s.is_claude) continue;
     const key = s.host + "\u0000" + s.target;
     seen.add(key);
@@ -225,7 +219,7 @@ function notifyTransitions() {
   for (const k of S.prevStatus.keys()) if (!seen.has(k)) S.prevStatus.delete(k);
 }
 
-// ------------------------------------------------------------------ ANSI -> HTML
+// ------------------------------------------------------------------ ANSI -> HTML (screen tab)
 const PAL16 = ["#2e3138", "#e5676f", "#8fc56b", "#d9a35a", "#5aa8ef", "#c677dd", "#4fbac6", "#d8d8d4",
   "#6b707b", "#ff7a82", "#a8de82", "#f0bf72", "#79c0ff", "#dd93f0", "#6fd6e1", "#ffffff"];
 function c256(n) {
@@ -255,19 +249,18 @@ function sgr(st, params) {
 function spanFor(st, text) {
   const t = esc(text);
   let fg = st.fg, bg = st.bg;
-  if (st.r) { [fg, bg] = [bg || "var(--term-bg)", fg || "var(--term-fg)"]; }
+  if (st.r) [fg, bg] = [bg || "var(--term-bg)", fg || "var(--term-fg)"];
   const cls = (st.b ? " b" : "") + (st.d ? " d" : "") + (st.i ? " i" : "") + (st.u ? " u" : "");
   const style = (fg ? `color:${fg};` : "") + (bg ? `background:${bg};` : "");
   if (!cls && !style) return t;
   return `<span${cls ? ` class="${cls.trim()}"` : ""}${style ? ` style="${style}"` : ""}>${t}</span>`;
 }
 const CSI = /\x1b\[([0-9;?]*)([ -\/]*)([@-~])|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-Za-z0-9]|\x1b[=>78]/g;
-function ansiToHtml(text, wrap) {
+function ansiLines(text) {
   const st = { fg: null, bg: null, b: false, d: false, i: false, u: false, r: false };
   const lines = text.replace(/\r/g, "").split("\n");
   while (lines.length && lines[lines.length - 1].replace(CSI, "").trim() === "") lines.pop();
-  const out = [];
-  for (const line of lines) {
+  return lines.map((line) => {
     const segs = [];
     let last = 0, m;
     CSI.lastIndex = 0;
@@ -277,7 +270,6 @@ function ansiToHtml(text, wrap) {
       last = CSI.lastIndex;
     }
     if (last < line.length) segs.push([{ ...st }, line.slice(last)]);
-    // trim trailing padding that has no background colour
     while (segs.length) {
       const [s0, t] = segs[segs.length - 1];
       if (s0.bg || s0.r) break;
@@ -285,6 +277,14 @@ function ansiToHtml(text, wrap) {
       if (tt) { segs[segs.length - 1][1] = tt; break; }
       segs.pop();
     }
+    return segs;
+  });
+}
+function ansiToHtml(text, wrap, tail) {
+  let lines = ansiLines(text);
+  if (tail) lines = lines.filter((l) => l.map((x) => x[1]).join("").trim()).slice(-tail);
+  const out = [];
+  for (const segs of lines) {
     const plain = segs.map((x) => x[1]).join("");
     if (wrap && /^\s*[─━═]{8,}\s*$/.test(plain)) { out.push('<div class="rule"></div>'); continue; }
     out.push(segs.map(([s0, t]) => spanFor(s0, t)).join(""));
@@ -292,31 +292,97 @@ function ansiToHtml(text, wrap) {
   return out.join("\n").replace(/\n?<div class="rule"><\/div>\n?/g, '<div class="rule"></div>');
 }
 
-// ------------------------------------------------------------------ session view
-let paneTimer = null, paneBusy = false;
-function findSession(host, target) {
-  return allSessions().find((s) => s.host === host && s.target === target);
+// ------------------------------------------------------------------ markdown (chat tab)
+function inline(t) {
+  let s = esc(t);
+  const codes = [];
+  s = s.replace(/`([^`]+)`/g, (_, c) => { codes.push(c); return "\u0000" + (codes.length - 1) + "\u0000"; });
+  s = s.replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>").replace(/(^|[^*\w])\*([^*\n]+)\*(?!\w)/g, "$1<i>$2</i>");
+  s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  return s.replace(/\u0000(\d+)\u0000/g, (_, n) => "<code>" + codes[n] + "</code>");
 }
+const BLOCK_START = /^\s*(```|~~~|#{1,6}\s|[-*+]\s|\d+[.)]\s|>)/;
+const LIST = /^\s*([-*+]|\d+[.)])\s+/;
+function md(src) {
+  const lines = String(src).replace(/\r/g, "").split("\n");
+  const out = [];
+  let i = 0;
+  while (i < lines.length) {
+    const l = lines[i];
+    const fence = l.match(/^\s*(```|~~~)/);
+    if (fence) {
+      const buf = []; i++;
+      while (i < lines.length && !lines[i].trim().startsWith(fence[1])) buf.push(lines[i++]);
+      i++;
+      out.push("<pre><code>" + esc(buf.join("\n")) + "</code></pre>");
+      continue;
+    }
+    if (/^\s*\|.*\|\s*$/.test(l)) {
+      const buf = [];
+      while (i < lines.length && /^\s*\|/.test(lines[i])) buf.push(lines[i++]);
+      out.push("<pre>" + esc(buf.join("\n")) + "</pre>");
+      continue;
+    }
+    const h = l.match(/^(#{1,6})\s+(.*)$/);
+    if (h) { const n = Math.min(h[1].length + 1, 4); out.push(`<h${n}>${inline(h[2])}</h${n}>`); i++; continue; }
+    if (LIST.test(l)) {
+      // one level of nesting: deeper-indented items go into a sub-list of the item above them
+      const ind = (x) => x.match(/^\s*/)[0].length, base = ind(l);
+      const items = [];
+      while (i < lines.length && LIST.test(lines[i]) && ind(lines[i]) >= base) {
+        const deep = ind(lines[i]) > base, ord = /^\s*\d/.test(lines[i]);
+        let text = lines[i++].replace(LIST, "");
+        while (i < lines.length && /^\s{2,}\S/.test(lines[i]) && !LIST.test(lines[i])) text += " " + lines[i++].trim();
+        if (deep && items.length) (items[items.length - 1].sub ||= { ord, li: [] }).li.push(text);
+        else items.push({ text });
+      }
+      const tag = /^\s*\d/.test(l) ? "ol" : "ul";
+      out.push(`<${tag}>` + items.map((it) => "<li>" + inline(it.text) + (it.sub
+        ? `<${it.sub.ord ? "ol" : "ul"}>` + it.sub.li.map((t) => "<li>" + inline(t) + "</li>").join("") + `</${it.sub.ord ? "ol" : "ul"}>` : "") + "</li>").join("") + `</${tag}>`);
+      continue;
+    }
+    if (/^\s*>/.test(l)) {
+      const buf = [];
+      while (i < lines.length && /^\s*>/.test(lines[i])) buf.push(inline(lines[i++].replace(/^\s*>\s?/, "")));
+      out.push("<blockquote>" + buf.join("<br>") + "</blockquote>");
+      continue;
+    }
+    if (!l.trim()) { i++; continue; }
+    const buf = [inline(lines[i++])];
+    while (i < lines.length && lines[i].trim() && !BLOCK_START.test(lines[i]) && !/^\s*\|.*\|\s*$/.test(lines[i])) buf.push(inline(lines[i++]));
+    out.push("<p>" + buf.join("<br>") + "</p>");
+  }
+  return out.join("");
+}
+
+// ------------------------------------------------------------------ session view
+let paneTimer = null, chatTimer = null;
 function openSession(host, target) {
+  const key = host + "\u0000" + target;
   const same = S.current && S.current.host === host && S.current.target === target;
   S.current = { host, target };
-  $(".main").classList.add("has-session");
   $("#session-view").hidden = false;
+  $("#projects-view").hidden = true;
   if (!same) {
-    S.paneHash = ""; S.lastPane = null;
+    S.pane = null; S.paneHash = "";
+    S.chat = { key, items: [], start: null, end: null, error: "", open: new Set(), folds: new Set(), loading: true };
     $("#term").innerHTML = '<span class="d">loading…</span>';
+    $("#term").dataset.init = "";
+    $("#chat").innerHTML = '<div class="chat-note">Loading the conversation…</div>';
+    $("#waiting-card").hidden = true;
     $("#prompt").value = store.get("draft:" + host + ":" + target, "");
     autoGrow(); updateCount();
+    loadChat();
   }
+  setTab(S.tab);
   renderSessionHeader();
   renderSessions();
   pollPane(true);
   scheduleState();
 }
 function closeSession() {
-  S.current = null;
-  clearTimeout(paneTimer);
-  $(".main").classList.remove("has-session");
+  S.current = null; S.chat = null;
+  clearTimeout(paneTimer); clearTimeout(chatTimer);
   $("#session-view").hidden = true;
   renderSessions();
   scheduleState();
@@ -334,25 +400,128 @@ function renderSessionHeader() {
   $("#dec-btn").disabled = !(s && s.decisions_path);
   $("#dec-btn").title = s && s.decisions_path ? s.decisions_path : "No DECISIONS.md found at or above this folder";
 }
+function setTab(tab) {
+  S.tab = tab; store.set("tab", tab);
+  $$(".tab").forEach((b) => b.classList.toggle("on", b.dataset.tab === tab));
+  $("#chat").hidden = tab !== "chat";
+  $("#term-wrap").hidden = tab !== "screen";
+  $("#screen-tools").hidden = tab !== "screen";
+  if (tab === "screen") renderPane(); else renderWaiting();
+  updateJump();
+}
+const scroller = () => (S.tab === "chat" ? $("#chat") : $("#term"));
+function updateJump() { $("#jump-btn").hidden = atBottom(scroller()); }
+
+// ---- chat
+async function loadChat(older) {
+  const c = S.chat, cur = S.current;
+  if (!c || !cur) return;
+  try {
+    const params = { host: cur.host, target: cur.target };
+    if (older) params.before = c.start;
+    const r = await api("GET", "/hub/transcript", params);
+    if (S.chat !== c) return;
+    c.error = "";
+    if (older) {
+      c.items = r.items.concat(c.items); c.start = r.start;
+      const el = $("#chat"), h0 = el.scrollHeight, t0 = el.scrollTop;
+      renderChat(false);
+      el.scrollTop = el.scrollHeight - h0 + t0;   // keep the reader where they were
+    } else {
+      c.items = r.items; c.start = r.start; c.end = r.end; c.path = r.path; c.loading = false;
+      renderChat(true);
+    }
+  } catch (e) {
+    if (S.chat !== c) return;
+    c.loading = false; c.error = e.message;
+    renderChat(false);
+  }
+  if (!older) scheduleChat();
+}
+function scheduleChat() {
+  clearTimeout(chatTimer);
+  chatTimer = setTimeout(pollChat, Date.now() < S.fastUntil ? 1000 : 2500);
+}
+async function pollChat() {
+  const c = S.chat, cur = S.current;
+  if (!c || !cur) return;
+  if (c.end == null) return loadChat();          // no transcript yet: keep trying to find one
+  if (document.hidden) return scheduleChat();
+  try {
+    const r = await api("GET", "/hub/transcript", { host: cur.host, target: cur.target, since: c.end });
+    if (S.chat !== c) return;
+    if (r.reset || (c.path && r.path !== c.path)) return loadChat();   // /clear or resume started a new file
+    if (r.items.length) { c.items = c.items.concat(r.items); renderChat(false); }
+    c.end = r.end;
+  } catch (e) { /* transient; keep polling */ }
+  scheduleChat();
+}
+function renderChat(forceBottom) {
+  const c = S.chat, el = $("#chat");
+  if (!c) return;
+  const stick = forceBottom || atBottom(el);
+  if (c.error && !c.items.length) {
+    el.innerHTML = `<div class="chat-note">${esc(c.error)}<br><br><button class="btn small" data-act="to-screen">Show the screen instead</button></div>`;
+    return;
+  }
+  const results = new Map(c.items.filter((i) => i.kind === "result").map((i) => [i.tool_id, i]));
+  const parts = [];
+  if (c.start > 0) parts.push(`<button class="btn small older" data-act="older">Load earlier messages</button>`);
+  let run = [];
+  const flush = () => {
+    if (!run.length) return;
+    const id = run[0].tool_id;
+    if (run.length > 3 && !c.folds.has(id)) {
+      const errs = run.filter((t) => (results.get(t.tool_id) || {}).is_error).length;
+      const names = [...new Set(run.map((t) => t.name))].slice(0, 4).join(", ");
+      parts.push(`<div class="tools-fold" data-fold="${esc(id)}">▸ ${run.length} tool calls (${esc(names)})${errs ? ` · <span class="error">${errs} failed</span>` : ""}</div>`);
+    } else {
+      for (const t of run) parts.push(toolHtml(t, results.get(t.tool_id), c.open.has(t.tool_id)));
+    }
+    run = [];
+  };
+  for (const it of c.items) {
+    if (it.kind === "tool") { run.push(it); continue; }
+    if (it.kind === "result") continue;
+    flush();
+    if (it.kind === "user") parts.push(`<div class="msg user${it.text.length > 900 ? " long" : ""}">${esc(it.text)}</div>`);
+    else if (it.kind === "command") parts.push(`<div class="msg command">${esc(it.text)}</div>`);
+    else if (it.kind === "assistant") parts.push(`<div class="msg assistant">${md(it.text)}</div>`);
+  }
+  flush();
+  if (!c.items.length) parts.push(`<div class="chat-note">${c.loading ? "Loading…" : "No messages yet."}</div>`);
+  const prevTop = el.scrollTop;
+  el.innerHTML = parts.join("");
+  el.scrollTop = stick ? el.scrollHeight : prevTop;
+  updateJump();
+}
+function toolHtml(t, res, open) {
+  const state = !res ? "…" : res.is_error ? "✗" : "✓";
+  return `<div class="tool" data-tool="${esc(t.tool_id)}"><div class="tool-head"><span class="tool-name">${esc(t.name)}</span>
+    <span class="tool-sum">${esc(t.summary)}</span><span class="tool-state${res && res.is_error ? " err" : ""}">${state}</span></div>
+    ${open ? `<div class="tool-out">${esc(t.summary)}${res ? "\n\n" + esc(res.text) + (res.truncated ? "\n…(cut)" : "") : "\n\n(no result yet)"}</div>` : ""}</div>`;
+}
+
+// ---- screen
 async function pollPane(force) {
   clearTimeout(paneTimer);
   if (!S.current) return;
-  if (!document.hidden && (!paneBusy || force)) {
-    paneBusy = true;
-    const cur = S.current;
+  const cur = S.current;
+  if (!document.hidden) {
     try {
-      const p = await api("GET", "/hub/pane", { host: cur.host, target: cur.target, history: 400 });
+      const p = await api("GET", "/hub/pane", { host: cur.host, target: cur.target, history: 0 });
       if (S.current === cur && (p.hash !== S.paneHash || force)) {
-        S.paneHash = p.hash; S.lastPane = p;
-        renderPane();
+        S.paneHash = p.hash; S.pane = p;
+        if (S.tab === "screen") renderPane();
+        renderWaiting();
       }
     } catch (e) {
-      if (S.current === cur && e.status !== 401) $("#term").innerHTML = `<span style="color:#e5676f">${esc(e.message)}</span>`;
-      if (e.status === 401) showLogin("Token rejected.");
-    } finally { paneBusy = false; }
+      if (S.current === cur && S.tab === "screen") $("#term").innerHTML = `<span style="color:#e5676f">${esc(e.message)}</span>`;
+      if (e.status === 401) showLogin(e.message);
+    }
   }
   const fast = Date.now() < S.fastUntil;
-  paneTimer = setTimeout(() => pollPane(false), fast ? 400 : 1000);
+  paneTimer = setTimeout(() => pollPane(false), fast ? 500 : (S.tab === "screen" ? 1000 : 2000));
 }
 let charRatio = 0;
 function monoRatio() {
@@ -362,33 +531,34 @@ function monoRatio() {
   charRatio = c.measureText("MMMMMMMMMM").width / 1000 || 0.6;
   return charRatio;
 }
-function fitFont(cols) {
-  const w = $("#term-wrap").clientWidth - 22;
-  return Math.max(3, Math.min(16, w / (cols * monoRatio())));
-}
+function fitFont(cols) { return Math.max(3, Math.min(16, ($(".pane-area").clientWidth - 22) / (cols * monoRatio()))); }
 function effectiveMode() {
   if (S.termMode !== "auto") return S.termMode;
-  const cols = (S.lastPane && S.lastPane.width) || 120;
-  return fitFont(cols) >= 8 ? "fit" : "wrap";
+  return fitFont((S.pane && S.pane.width) || 120) >= 8 ? "fit" : "wrap";
 }
 function renderPane() {
-  const p = S.lastPane;
+  const p = S.pane, term = $("#term");
   if (!p) return;
-  const term = $("#term");
-  const mode = effectiveMode();
-  const atBottom = term.scrollHeight - term.scrollTop - term.clientHeight < 60;
+  const mode = effectiveMode(), stick = atBottom(term) || !term.dataset.init;
   term.classList.toggle("wrap", mode === "wrap");
   term.style.setProperty("--term-font", (mode === "fit" ? fitFont(p.width) : S.wrapFont) + "px");
   term.innerHTML = ansiToHtml(p.text, mode === "wrap");
-  if (atBottom || !term.dataset.init) { term.scrollTop = term.scrollHeight; term.dataset.init = "1"; }
-  $("#jump-btn").hidden = term.scrollHeight - term.scrollTop - term.clientHeight < 60;
+  if (stick) { term.scrollTop = term.scrollHeight; term.dataset.init = "1"; }
+  updateJump();
+}
+function renderWaiting() {
+  const s = S.current && findSession(S.current.host, S.current.target);
+  const waiting = (S.pane && S.pane.status === "waiting") || (s && s.status === "waiting");
+  const show = !!(waiting && S.tab === "chat" && S.pane);
+  $("#waiting-card").hidden = !show;
+  if (show) $("#waiting-screen").innerHTML = ansiToHtml(S.pane.text, true, 16);
 }
 
+// ---- sending
 async function sendPrompt(ev) {
   ev && ev.preventDefault();
   if (!S.current) return;
-  const text = $("#prompt").value;
-  const submit = !$("#no-submit").checked;
+  const text = $("#prompt").value, submit = !$("#no-submit").checked;
   if (!text && !submit) return;
   const cur = S.current;
   $("#send-btn").disabled = true;
@@ -397,29 +567,93 @@ async function sendPrompt(ev) {
     $("#prompt").value = ""; store.del("draft:" + cur.host + ":" + cur.target);
     autoGrow(); updateCount();
     toast(submit ? "Sent" : "Pasted (not submitted)", { ms: 1500 });
-    S.fastUntil = Date.now() + 6000;
-    $("#term").dataset.init = "";
-    pollPane(true);
-  } catch (e) {
-    toast("Send failed: " + e.message, { err: true, ms: 6000 });
-  } finally { $("#send-btn").disabled = false; }
+    S.fastUntil = Date.now() + 8000;
+    pollPane(true); scheduleChat();
+    $("#chat").scrollTop = $("#chat").scrollHeight;
+  } catch (e) { toast("Send failed: " + e.message, { err: true, ms: 6000 }); }
+  finally { $("#send-btn").disabled = false; }
 }
 async function sendKey(k) {
   if (!S.current) return;
   try {
     await api("POST", "/hub/keys", null, { host: S.current.host, target: S.current.target, keys: [k] });
-    S.fastUntil = Date.now() + 3000;
+    S.fastUntil = Date.now() + 4000;
     pollPane(true);
   } catch (e) { toast(e.message, { err: true }); }
 }
-function autoGrow() {
-  const ta = $("#prompt");
-  ta.style.height = "auto";
-  ta.style.height = Math.min(ta.scrollHeight + 2, window.innerHeight * 0.4) + "px";
-}
+function autoGrow() { const ta = $("#prompt"); ta.style.height = "auto"; ta.style.height = Math.min(ta.scrollHeight + 2, window.innerHeight * 0.4) + "px"; }
 function updateCount() {
   const n = $("#prompt").value.length;
   $("#prompt-count").textContent = n > 200 ? `${n.toLocaleString()} chars ≈ ${fmtTokens(Math.round(n / 4))} tok` : "";
+}
+
+// ------------------------------------------------------------------ devices & accounts
+const S_OPEN = new Set();   // devices whose SSH form is expanded
+function openDevices() { $("#devices-sheet").hidden = false; renderDevices(); }
+function renderDevices() {
+  const st = S.state;
+  if (!st) return;
+  $("#devices-hint").innerHTML = `This page runs on <b>${esc(st.hub)}</b>. Other machines are reached from there over SSH
+    (key login must already work from ${esc(st.hub)} without a password; nothing gets installed), or directly if they run <code>cm</code>.`;
+  $("#devices-list").innerHTML = (st.devices || []).map((d) => {
+    const self = d.status === "this machine";
+    const usable = self || d.has_agent || d.via === "ssh";
+    const err = d.status.startsWith("error");
+    const showForm = !self && (S_OPEN.has(d.name) || err);
+    const os = d.os === "win32" || d.os === "windows" ? "Windows" : d.os || "";
+    return `<div class="dev" data-name="${esc(d.name)}">
+      <div class="dev-head"><span class="dot ${d.online ? "on" : ""}"></span><span class="dev-name">${esc(d.name)}</span>
+        <span class="badge">${esc(os)}</span>
+        <label class="switch" title="show this device's sessions"><input type="checkbox" data-act="toggle" data-usable="${usable ? 1 : 0}" ${d.enabled ? "checked" : ""} ${self ? "" : ""}><span></span></label></div>
+      <div class="dev-status${err ? " err" : ""}">${esc(d.status)}${!self && !showForm ? ` · <a href="#" data-act="edit">${usable ? "SSH settings" : "Set up SSH"}</a>` : ""}</div>
+      ${showForm ? `<div class="dev-ssh"><input data-f="ssh" placeholder="${esc("user@" + d.name)}" value="${esc(d.ssh)}" autocapitalize="off" autocorrect="off" spellcheck="false">
+        <input data-f="python" placeholder="${os === "Windows" ? "python" : "python3"}" value="${esc(d.python)}" autocapitalize="off" spellcheck="false"></div>
+        <div class="dev-actions"><button class="btn small primary" data-act="ssh">${d.via === "ssh" ? "Save" : "Connect over SSH"}</button>
+        ${d.via === "ssh" ? `<button class="btn small" data-act="auto">Stop using SSH</button>` : ""}</div>` : ""}
+    </div>`;
+  }).join("");
+  const hid = hidden();
+  const accts = new Map();
+  for (const u of st.accounts || []) accts.set(u.account.key, u.account);
+  for (const s of allSessions()) if (s.account && !accts.has(s.account.key)) accts.set(s.account.key, s.account);
+  $("#accounts-list").innerHTML = [...accts.values()].map((a) => `<div class="acct-row" data-key="${esc(a.key)}">
+      <span class="grow stack"><b>${esc(a.label)}</b><span class="sub">${esc(a.email || "")}</span></span>
+      <label class="switch"><input type="checkbox" data-act="acct" ${hid.has(a.key) ? "" : "checked"}><span></span></label></div>`).join("")
+    || `<div class="muted small">No accounts yet.</div>`;
+}
+async function deviceAction(e) {
+  const dev = e.target.closest(".dev");
+  if (!dev) return;
+  const name = dev.dataset.name, act = e.target.dataset.act;
+  if (act === "edit") { e.preventDefault(); S_OPEN.add(name); renderDevices(); return; }
+  let body = null;
+  if (act === "toggle" && e.target.dataset.usable === "0") { S_OPEN.add(name); renderDevices(); return; }   // needs SSH first
+  if (act === "toggle") body = { name, enabled: e.target.checked };
+  else if (act === "ssh") {
+    body = { name, via: "ssh", enabled: true, ssh: $("[data-f=ssh]", dev).value.trim(), python: $("[data-f=python]", dev).value.trim() };
+    e.target.disabled = true; e.target.textContent = "Connecting…";
+  } else if (act === "auto") body = { name, via: "auto" };
+  if (!body) return;
+  try {
+    await api("POST", "/hub/device", null, body);
+    await refreshState();
+    if (act === "ssh") {
+      const d = (S.state.devices || []).find((x) => x.name === name);
+      const bad = d && d.status.startsWith("error");
+      if (!bad) S_OPEN.delete(name);
+      toast(bad ? d.status : `${name} connected`, { err: bad, ms: 7000 });
+    }
+    renderDevices();
+  } catch (err) { toast(err.message, { err: true }); renderDevices(); }
+}
+async function accountToggle(e) {
+  const row = e.target.closest(".acct-row");
+  if (!row || e.target.dataset.act !== "acct") return;
+  try {
+    const r = await api("POST", "/hub/account", null, { key: row.dataset.key, hidden: !e.target.checked });
+    S.state.hidden_accounts = r.hidden_accounts;
+    renderSessions(); renderUsage();
+  } catch (err) { toast(err.message, { err: true }); }
 }
 
 // ------------------------------------------------------------------ DECISIONS sheet
@@ -434,21 +668,15 @@ async function openDecisions(host, dir, fromSession) {
     data.entries.forEach((e) => { if (e.body != null) S.dec.bodies.set(e.index, e.body); });
     $("#dec-title").textContent = data.project + " · " + data.count + (data.count === 1 ? " entry" : " entries");
     $("#dec-path").textContent = host + " · " + data.path;
-    const url = ((S.state && S.state.prefs && S.state.prefs.perplexity) || {})[data.project] || "";
-    $("#pplx-url").value = url;
+    $("#pplx-url").value = ((S.state && S.state.prefs && S.state.prefs.perplexity) || {})[data.project] || "";
     syncPplxLink();
-    const n = store.get("lastN:" + data.project, 1);
-    setLastN(Math.min(n, data.count));
-  } catch (e) {
-    $("#dec-list").innerHTML = `<div class="empty error">${esc(e.message)}</div>`;
-  }
+    setLastN(Math.min(store.get("lastN:" + data.project, 1), data.count));
+  } catch (e) { $("#dec-list").innerHTML = `<div class="empty error">${esc(e.message)}</div>`; }
 }
 function closeDecisions() { $("#dec-sheet").hidden = true; S.dec = null; }
 function syncPplxLink() {
-  const url = $("#pplx-url").value.trim();
-  const a = $("#pplx-open");
-  if (/^https?:\/\//.test(url)) { a.href = url; a.classList.remove("disabled"); a.removeAttribute("aria-disabled"); }
-  else { a.removeAttribute("href"); a.setAttribute("aria-disabled", "true"); }
+  const url = $("#pplx-url").value.trim(), a = $("#pplx-open");
+  if (/^https?:\/\//.test(url)) a.href = url; else a.removeAttribute("href");
 }
 async function savePplx() {
   if (!S.dec || !S.dec.data) return;
@@ -486,8 +714,7 @@ async function ensureBodies(indexes) {
 function renderDecisions() {
   const d = S.dec;
   if (!d || !d.data) return;
-  const list = $("#dec-list");
-  const scroll = list.scrollTop;
+  const list = $("#dec-list"), scroll = list.scrollTop;
   list.innerHTML = d.data.entries.map((e) => {
     const sel = d.selected.has(e.index), open = d.expanded.has(e.index);
     const body = open ? (d.bodies.has(e.index) ? esc(d.bodies.get(e.index)) : "loading…") : "";
@@ -499,8 +726,7 @@ function renderDecisions() {
           <div class="dec-title">${esc(e.title)}</div>
           ${e.tags.length ? `<div class="dec-tag">${esc(e.tags.join(" · "))}</div>` : ""}
         </div></div>
-      ${open ? `<div class="dec-body">${body}</div>` : ""}
-    </div>`;
+      ${open ? `<div class="dec-body">${body}</div>` : ""}</div>`;
   }).join("") || '<div class="empty">No "## " entries found in this file.</div>';
   list.scrollTop = scroll;
   updateDecSum();
@@ -523,28 +749,26 @@ function selectedText() {
 async function loadProjects() {
   const box = $("#projects");
   box.innerHTML = '<div class="empty">Loading…</div>';
-  try {
-    S.projects = await api("GET", "/hub/projects");
-  } catch (e) { box.innerHTML = `<div class="empty error">${esc(e.message)}</div>`; return; }
+  try { S.projects = await api("GET", "/hub/projects"); }
+  catch (e) { box.innerHTML = `<div class="empty error">${esc(e.message)}</div>`; return; }
   const seen = new Set(), rows = [];
   const add = (p) => { const k = p.host + "\u0000" + p.dir.toLowerCase(); if (!seen.has(k)) { seen.add(k); rows.push(p); } };
-  for (const s of allSessions()) if (s.is_claude && s.decisions_path) {
-    const dir = s.decisions_path.replace(/[\\/][^\\/]+$/, "");
-    add({ host: s.host, name: s.project, dir, decisions_path: s.decisions_path });
+  for (const s of visibleSessions()) if (s.is_claude && s.decisions_path) {
+    add({ host: s.host, name: s.project, dir: s.decisions_path.replace(/[\\/][^\\/]+$/, ""), decisions_path: s.decisions_path, last_used: Date.now() / 1000 });
   }
   S.projects.forEach(add);
   rows.sort((a, b) => (b.last_used || 0) - (a.last_used || 0) || (!!b.decisions_path - !!a.decisions_path) || a.name.localeCompare(b.name));
   box.innerHTML = rows.length ? rows.map((p, i) => `<div class="card" data-pi="${i}" style="cursor:default">
-      <span class="dot ${p.decisions_path ? "idle" : "shell"}"></span><span class="title">${esc(p.name)}</span><span class="badge">${esc(p.host)}</span>
+      <span class="dot ${p.decisions_path ? "idle" : ""}"></span><span class="title">${esc(p.name)}</span><span class="badge">${esc(p.host)}</span>
       <span class="meta">${p.last_used ? "used " + esc(rel(p.last_used)) + " · " : ""}${esc(p.dir)}</span>
       <div class="actions">${p.decisions_path ? `<button class="btn small" data-act="dec">DECISIONS</button>` : `<span class="muted small">no DECISIONS.md</span>`}
       <button class="btn small" data-act="new">New session here</button></div></div>`).join("")
-    : `<div class="empty">No projects yet. Add folders to <code>project_roots</code> in each machine's config.</div>`;
+    : `<div class="empty">No projects yet.</div>`;
   box._rows = rows;
 }
 function openNew(host, cwd) {
   const hosts = ((S.state && S.state.hosts) || []).filter((h) => h.ok && h.info);
-  if (!hosts.length) return toast("No machine online", { err: true });
+  if (!hosts.length) return toast("No device online", { err: true });
   $("#new-host").innerHTML = hosts.map((h) => `<option>${esc(h.name)}</option>`).join("");
   $("#new-host").value = host && hosts.some((h) => h.name === host) ? host : (S.current ? S.current.host : hosts[0].name);
   fillNewHost();
@@ -577,26 +801,23 @@ async function submitNew(ev) {
     await refreshState();
     const s = allSessions().find((x) => x.host === host && x.session === res.session);
     if (s) location.hash = sessionHash(host, s.target);
-  } catch (e) {
-    $("#new-error").textContent = e.message; $("#new-error").hidden = false;
-  } finally { btn.disabled = false; }
+  } catch (e) { $("#new-error").textContent = e.message; $("#new-error").hidden = false; }
+  finally { btn.disabled = false; }
 }
 
 // ------------------------------------------------------------------ login / boot
 function showLogin(msg) {
   $("#app").hidden = true; $("#login").hidden = false;
   $("#login-error").hidden = !msg; $("#login-error").textContent = msg || "";
-  clearTimeout(stateTimer); clearTimeout(paneTimer);
+  clearTimeout(stateTimer); clearTimeout(paneTimer); clearTimeout(chatTimer);
 }
 async function start() {
-  try {
-    S.state = await api("GET", "/hub/state");
-  } catch (e) {
-    return showLogin(e.status === 401 ? e.message + (S.token ? " (the saved token was rejected)" : "") : "Cannot reach the server: " + e.message);
-  }
+  try { S.state = await api("GET", "/hub/state"); }
+  catch (e) { return showLogin(e.status === 401 ? e.message : "Cannot reach the server: " + e.message); }
   $("#login").hidden = true; $("#app").hidden = false;
-  if (store.get("sideCollapsed", false) && innerWidth >= 900) $("#app").classList.add("side-collapsed");
-  renderSide(); renderSessions(); notifyTransitions();
+  $("#logout-btn").hidden = !S.token;
+  if (store.get("usageHidden", false)) $("#app").classList.add("usage-hidden");
+  renderUsage(); renderSessions(); notifyTransitions();
   route();
   scheduleState();
 }
@@ -604,12 +825,13 @@ async function start() {
 function bind() {
   $("#login-form").onsubmit = (e) => { e.preventDefault(); S.token = $("#login-token").value.trim(); store.set("token", S.token); start(); };
   $("#logout-btn").onclick = () => { store.del("token"); S.token = ""; showLogin(""); };
-  $("#side-toggle").onclick = () => {
+  const wide = () => innerWidth >= 1200;
+  $("#usage-btn").onclick = () => {
     const app = $("#app");
-    if (innerWidth < 900) app.classList.toggle("side-open");
-    else { app.classList.toggle("side-collapsed"); store.set("sideCollapsed", app.classList.contains("side-collapsed")); }
+    if (wide()) { app.classList.toggle("usage-hidden"); store.set("usageHidden", app.classList.contains("usage-hidden")); }
+    else app.classList.toggle("usage-open");
   };
-  $("#side-close").onclick = $("#scrim").onclick = () => $("#app").classList.remove("side-open");
+  $("#usage-close").onclick = $("#scrim").onclick = () => $("#app").classList.remove("usage-open");
   $("#notify-btn").onclick = async () => {
     if (!("Notification" in window) || !window.isSecureContext) return toast("System notifications need HTTPS - see README (tailscale serve). In-page alerts still work.", { ms: 6000 });
     const r = await Notification.requestPermission();
@@ -624,29 +846,47 @@ function bind() {
   };
   $("#show-shells").checked = S.showShells;
   $("#show-shells").onchange = (e) => { S.showShells = e.target.checked; store.set("showShells", S.showShells); renderSessions(); };
-  $("#sessions").onclick = (e) => {
-    const c = e.target.closest(".card[data-target]");
-    if (c) location.hash = sessionHash(c.dataset.host, c.dataset.target);
-  };
-  $("#back-btn").onclick = () => { if (history.length > 1 && location.hash.startsWith("#/s/")) history.back(); else location.hash = "#/"; };
+  $("#sessions").onclick = (e) => { const c = e.target.closest(".card[data-target]"); if (c) location.hash = sessionHash(c.dataset.host, c.dataset.target); };
+  $("#back-btn").onclick = () => { location.hash = "#/"; };
   $("#projects-btn").onclick = () => (location.hash = "#/projects");
   $("#projects-back").onclick = () => (location.hash = "#/");
   $("#new-btn").onclick = () => openNew();
+  $("#devices-btn").onclick = openDevices;
+  $("#devices-close").onclick = () => ($("#devices-sheet").hidden = true);
+  $("#devices-sheet").onclick = (e) => { if (e.target.id === "devices-sheet") $("#devices-sheet").hidden = true; };
+  $("#devices-list").addEventListener("click", (e) => { if (e.target.dataset.act && e.target.dataset.act !== "toggle") deviceAction(e); });
+  $("#devices-list").addEventListener("change", (e) => { if (e.target.dataset.act === "toggle") deviceAction(e); });
+  $("#accounts-list").addEventListener("change", accountToggle);
   $("#projects").onclick = (e) => {
     const b = e.target.closest("[data-act]");
     if (!b) return;
     const p = $("#projects")._rows[+b.closest("[data-pi]").dataset.pi];
-    if (b.dataset.act === "dec") openDecisions(p.host, p.dir, false);
-    else openNew(p.host, p.dir);
+    if (b.dataset.act === "dec") openDecisions(p.host, p.dir, false); else openNew(p.host, p.dir);
   };
 
-  $("#term").onscroll = () => { const t = $("#term"); $("#jump-btn").hidden = t.scrollHeight - t.scrollTop - t.clientHeight < 60; };
-  $("#jump-btn").onclick = () => { const t = $("#term"); t.scrollTop = t.scrollHeight; };
+  // session view
+  $$(".tab").forEach((b) => (b.onclick = () => setTab(b.dataset.tab)));
+  $("#chat").onscroll = updateJump;
+  $("#term").onscroll = updateJump;
+  $("#jump-btn").onclick = () => { const el = scroller(); el.scrollTop = el.scrollHeight; updateJump(); };
+  $("#chat").onclick = (e) => {
+    const c = S.chat;
+    if (!c) return;
+    const act = e.target.closest("[data-act]");
+    if (act && act.dataset.act === "older") { act.disabled = true; act.textContent = "Loading…"; return loadChat(true); }
+    if (act && act.dataset.act === "to-screen") return setTab("screen");
+    const fold = e.target.closest("[data-fold]");
+    if (fold) { c.folds.add(fold.dataset.fold); return renderChat(false); }
+    const tool = e.target.closest(".tool-head");
+    if (tool) { const id = tool.parentElement.dataset.tool; if (c.open.has(id)) c.open.delete(id); else c.open.add(id); return renderChat(false); }
+    const long = e.target.closest(".msg.user.long");
+    if (long) long.classList.toggle("open");
+  };
   $("#fit-btn").onclick = () => { S.termMode = effectiveMode() === "fit" ? "wrap" : "fit"; store.set("termMode", S.termMode); renderPane(); };
   const bump = (d) => { S.wrapFont = Math.max(8, Math.min(20, S.wrapFont + d)); store.set("wrapFont", S.wrapFont); S.termMode = "wrap"; store.set("termMode", "wrap"); renderPane(); };
   $("#font-up").onclick = () => bump(1);
   $("#font-down").onclick = () => bump(-1);
-  window.addEventListener("resize", () => { if (S.lastPane) renderPane(); });
+  window.addEventListener("resize", () => { if (S.pane && S.tab === "screen") renderPane(); });
   $("#keybar").onclick = (e) => { const b = e.target.closest("[data-k]"); if (b) sendKey(b.dataset.k); };
   $("#composer").onsubmit = sendPrompt;
   $("#prompt").addEventListener("input", () => {
@@ -684,14 +924,12 @@ function bind() {
     }
   };
   $("#dec-copy").onclick = () => {
-    const t = selectedText();
-    copyText(t).then((ok) => toast(ok ? `Copied ${S.dec ? S.dec.selected.size : ""} entries` : "Copy failed - long-press to select instead", { err: !ok }));
+    copyText(selectedText()).then((ok) => toast(ok ? `Copied ${S.dec ? S.dec.selected.size : ""} entries` : "Copy failed - long-press to select instead", { err: !ok }));
   };
   $("#dec-pplx").onclick = () => {
     const url = $("#pplx-url").value.trim();
     if (!/^https?:\/\//.test(url)) { toast("Paste this project's Perplexity thread URL first", { err: true }); $("#pplx-url").focus(); return; }
-    const t = selectedText();
-    const p = copyText(t);
+    const p = copyText(selectedText());
     window.open(url, "_blank", "noopener");   // same tap, so popup blockers allow it
     p.then((ok) => toast(ok ? "Copied - paste it into the thread" : "Copy failed", { err: !ok }));
   };
@@ -707,21 +945,27 @@ function bind() {
     ta.focus();
   };
 
-  // new session sheet
   $("#new-close").onclick = () => ($("#new-sheet").hidden = true);
   $("#new-sheet").onclick = (e) => { if (e.target.id === "new-sheet") $("#new-sheet").hidden = true; };
   $("#new-host").onchange = fillNewHost;
   $("#new-form").onsubmit = submitNew;
 
   window.addEventListener("hashchange", route);
-  document.addEventListener("visibilitychange", () => { if (!document.hidden && S.token && !$("#app").hidden) { refreshState(); pollPane(true); } });
-  document.addEventListener("keydown", (e) => { if (e.key === "Escape") { if (!$("#dec-sheet").hidden) closeDecisions(); else if (!$("#new-sheet").hidden) $("#new-sheet").hidden = true; } });
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden && !$("#app").hidden) { refreshState(); if (S.current) { pollPane(true); scheduleChat(); } }
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape") return;
+    if (!$("#dec-sheet").hidden) closeDecisions();
+    else if (!$("#new-sheet").hidden) $("#new-sheet").hidden = true;
+    else if (!$("#devices-sheet").hidden) $("#devices-sheet").hidden = true;
+  });
 }
 
 window.addEventListener("error", (e) => toast("UI error: " + e.message, { err: true, ms: 8000 }));
 window.addEventListener("unhandledrejection", (e) => toast("UI error: " + ((e.reason && e.reason.message) || e.reason), { err: true, ms: 8000 }));
 
-// token may arrive as #token=... (handy for opening on a phone once)
+// token may arrive as #token=...&to=... (only needed from outside your Tailscale account)
 (function boot() {
   const m = location.hash.match(/^#token=([^&]+)(?:&to=(.*))?$/);
   if (m) {
@@ -729,5 +973,5 @@ window.addEventListener("unhandledrejection", (e) => toast("UI error: " + ((e.re
     history.replaceState(null, "", location.pathname + (m[2] ? "#" + decodeURIComponent(m[2]) : ""));
   }
   bind();
-  if (S.token) start(); else showLogin("");
+  start();
 })();

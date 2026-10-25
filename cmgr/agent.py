@@ -13,6 +13,7 @@ import time
 from . import __version__
 from .claude_state import (UsageTracker, discover_accounts, expand, known_projects, last_text_line, match_proc,
                            read_registry, screen_status)
+from . import transcript as transcript_mod
 from .decisions import DecisionsCache, find_file, find_in_dir
 from .mux import Mux, MuxError
 
@@ -111,6 +112,16 @@ class Agent:
         return {"target": target, "text": text, "width": p.width, "height": p.height,
                 "hash": hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()[:16],
                 "status": screen_status(visible)}
+
+    def transcript(self, target: str, before: int | None = None, since: int | None = None) -> dict:
+        p = self._check_target(target)
+        proc = match_proc(p, read_registry(self.accounts()))
+        if not proc:
+            raise AgentError("no Claude Code session recorded for this pane", 404)
+        path = transcript_mod.find(proc.account_dir, proc.cwd, proc.session_id, proc.started_at - 5)
+        if not path:
+            raise AgentError("this session has no transcript yet", 404)
+        return transcript_mod.read(path, before=before, since=since)
 
     def send(self, target: str, text: str, submit: bool = True) -> dict:
         self._check_target(target)

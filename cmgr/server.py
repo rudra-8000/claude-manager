@@ -90,6 +90,9 @@ def dispatch_agent(agent: Agent, method: str, path: str, q: dict, body: dict):
             return agent.pane(q["target"], int(q.get("history", 300)))
         if path == "/api/usage":
             return agent.usage()
+        if path == "/api/transcript":
+            num = lambda k: int(q[k]) if q.get(k) not in (None, "") else None
+            return agent.transcript(q["target"], before=num("before"), since=num("since"))
         if path == "/api/projects":
             return agent.projects()
         if path == "/api/decisions":
@@ -115,19 +118,69 @@ DISCOVER_EVERY = 60.0
 
 
 class Hub:
+    """The one page's backend. Shows this machine plus every other machine you switch on in the Devices
+    panel: machines running `cm` are reached over HTTP, any other machine over SSH (nothing to install
+    there). Device and account visibility live in ~/.claude-manager/hub.json."""
+
     def __init__(self, cfg: dict, agent: Agent, ts: Tailscale | None = None):
         self.cfg = cfg
         self.ts = ts or Tailscale()
-        self.clients: dict[str, LocalClient | RemoteClient] = {cfg["name"]: LocalClient(agent)}
-        for peer in cfg.get("peers") or []:
-            self.clients[peer["name"]] = RemoteClient(peer["url"], peer.get("token") or cfg.get("token", ""))
-        self.pool = ThreadPoolExecutor(max_workers=16)
+        self.local = LocalClient(agent)
+        self.pool = ThreadPoolExecutor(max_workers=24)
         self.last: dict[str, dict] = {}
+        self.agents: dict[str, RemoteClient] = {}     # device name -> cm found running there
+        self.ssh: dict[str, object] = {}              # device name -> SSHClient
         self.discovered_at = 0.0
         self._discover_lock = threading.Lock()
+        self._settings_lock = threading.Lock()
+        self.settings_path = os.path.join(os.path.dirname(cfg["_path"]), "hub.json")
+        self.peers = {p["name"]: RemoteClient(p["url"], p.get("token") or cfg.get("token", "")) for p in cfg.get("peers") or []}
+        self.agents.update(self.peers)
 
+    # ------------------------------------------------------------ settings
+    def settings(self) -> dict:
+        try:
+            with open(self.settings_path, encoding="utf-8") as f:
+                s = json.load(f)
+        except (OSError, ValueError):
+            s = {}
+        s.setdefault("devices", {})
+        s.setdefault("hidden_accounts", [])
+        return s
+
+    def _save_settings(self, s: dict) -> None:
+        os.makedirs(os.path.dirname(self.settings_path), exist_ok=True)
+        with open(self.settings_path + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(s, f, indent=2)
+        os.replace(self.settings_path + ".tmp", self.settings_path)
+
+    def set_device(self, name: str, enabled=None, via=None, ssh=None, python=None) -> dict:
+        if via not in (None, "auto", "ssh"):
+            raise AgentError("via must be auto or ssh")
+        with self._settings_lock:
+            s = self.settings()
+            d = s["devices"].setdefault(name, {})
+            for k, v in (("enabled", enabled), ("via", via), ("ssh", ssh), ("python", python)):
+                if v is not None:
+                    d[k] = v.strip() if isinstance(v, str) else v
+            self._save_settings(s)
+        old = self.ssh.pop(name, None)
+        if old:
+            old.close()
+        self.last.pop(name, None)
+        return {"devices": self.devices()}
+
+    def set_account_hidden(self, key: str, hidden: bool) -> dict:
+        with self._settings_lock:
+            s = self.settings()
+            hid = [k for k in s["hidden_accounts"] if k != key] + ([key] if hidden else [])
+            s["hidden_accounts"] = hid
+            self._save_settings(s)
+        return {"hidden_accounts": hid}
+
+    # ------------------------------------------------------------ devices
     def discover(self, force: bool = False) -> None:
-        """Find `cm serve` on every online machine of my Tailscale user by probing its /api/info."""
+        """Note which of my Tailscale machines run `cm` (probe /api/info)."""
         if not self.cfg.get("discover", True):
             return
         if not force and time.time() - self.discovered_at < DISCOVER_EVERY:
@@ -135,52 +188,105 @@ class Hub:
         if not self._discover_lock.acquire(blocking=False):
             return
         try:
-            known_urls = {c.url for c in self.clients.values() if isinstance(c, RemoteClient)}
             port = int(self.cfg["port"])
+            mine = set(self.ts.my_ips())
 
             def probe(m):
-                url = f"http://{m['ip']}:{port}"
-                if url in known_urls:
-                    return None
-                c = RemoteClient(url, self.cfg.get("token", ""))
+                if m["ip"] in mine or not m["online"]:
+                    return m["label"], None
+                c = RemoteClient(f"http://{m['ip']}:{port}", self.cfg.get("token", ""))
                 try:
-                    info = c.call("GET", "/api/info", timeout=2.5)
-                    return (info.get("name") or m["name"], c)
+                    c.call("GET", "/api/info", timeout=2.5)
+                    return m["label"], c
                 except Exception:
-                    return None
+                    return m["label"], None
 
-            for hit in self.pool.map(probe, self.ts.my_machines()):
-                if hit:
-                    name, c = hit
-                    if name in self.clients:  # two machines with one hostname
-                        name = f"{name} ({c.url.split('//')[1].split(':')[0]})"
-                    self.clients[name] = c
+            for label, c in self.pool.map(probe, self.ts.my_devices()):
+                if c:
+                    self.agents[label] = c
+                elif label not in self.peers:
+                    self.agents.pop(label, None)
             self.discovered_at = time.time()
         finally:
             self._discover_lock.release()
 
+    def devices(self) -> list[dict]:
+        s = self.settings()["devices"]
+        me = self.cfg["name"]
+        mine = set(self.ts.my_ips())
+        rows = [{"name": me, "kind": "this machine", "online": True, "os": sys.platform, "ip": ""}]
+        seen = {me}
+        for m in self.ts.my_devices():
+            if m["ip"] in mine or m["label"] in seen:
+                continue
+            seen.add(m["label"])
+            rows.append({"name": m["label"], "kind": "tailscale", "online": m["online"], "os": m["os"], "ip": m["ip"]})
+        for name in list(s) + list(self.agents):
+            if name not in seen:
+                seen.add(name)
+                rows.append({"name": name, "kind": "configured", "online": True, "os": "", "ip": ""})
+        for r in rows:
+            d = s.get(r["name"], {})
+            r["via"] = d.get("via", "auto")
+            r["ssh"] = d.get("ssh", "")
+            r["python"] = d.get("python", "")
+            r["has_agent"] = r["name"] in self.agents
+            usable = r["name"] == me or r["has_agent"] or r["via"] == "ssh"
+            r["enabled"] = bool(d.get("enabled", usable)) and usable
+            last = self.last.get(r["name"])
+            if r["name"] == me:
+                r["status"] = "this machine"
+            elif not r["online"]:
+                r["status"] = "offline"
+            elif not usable:
+                r["status"] = "not connected"
+            elif not r["enabled"]:
+                r["status"] = "hidden"
+            elif last and not last.get("ok"):
+                r["status"] = "error: " + (last.get("error") or "")
+            else:
+                r["status"] = ("connected over SSH" if r["via"] == "ssh" else "connected (cm running there)")
+        return rows
+
+    def _client(self, name: str):
+        if name == self.cfg["name"]:
+            return self.local
+        d = self.settings()["devices"].get(name, {})
+        if d.get("via") == "ssh":
+            c = self.ssh.get(name)
+            if c is None:
+                from .remote import SSHClient
+                target = d.get("ssh") or name
+                c = self.ssh[name] = SSHClient(target, d.get("python") or "python3")
+            return c
+        return self.agents.get(name)
+
+    def active(self) -> list[str]:
+        return [d["name"] for d in self.devices() if d["enabled"] and d["online"]]
+
     def client(self, host: str):
-        c = self.clients.get(host)
+        c = self._client(host)
         if not c:
-            raise AgentError(f"unknown host: {host}", 404)
+            raise AgentError(f"unknown or disconnected device: {host}", 404)
         return c
 
     def _snap(self, name: str) -> dict:
         t0 = time.time()
         try:
-            snap = self.clients[name].call("GET", "/api/snapshot")
+            snap = self.client(name).call("GET", "/api/snapshot")
             entry = {"name": name, "ok": True, "error": "", "latency_ms": int((time.time() - t0) * 1000),
                      "seen_at": time.time(), **snap}
         except Exception as e:  # keep showing the last good data, marked offline
             prev = self.last.get(name, {})
             entry = {"name": name, "ok": False, "error": str(e), "seen_at": prev.get("seen_at"),
-                     "info": prev.get("info"), "sessions": prev.get("sessions", []), "usage": prev.get("usage", [])}
+                     "info": prev.get("info"), "sessions": prev.get("sessions", []), "usage": prev.get("usage", []),
+                     "prefs": prev.get("prefs")}
         self.last[name] = entry
         return entry
 
     def state(self) -> dict:
         self.discover()
-        hosts = list(self.pool.map(self._snap, list(self.clients)))
+        hosts = list(self.pool.map(self._snap, self.active()))
         accounts: dict[str, dict] = {}
         for h in hosts:
             for u in h.get("usage") or []:
@@ -197,22 +303,23 @@ class Hub:
                     accounts[key]["hosts"] = hosts_seen
                     # same account under different aliases on different machines -> one entry, all names
                     accounts[key]["account"] = {**accounts[key]["account"], "names": names, "label": " / ".join(names)}
+        settings = self.settings()
         return {"time": time.time(), "hub": self.cfg["name"], "hosts": hosts,
                 "accounts": sorted(accounts.values(), key=lambda a: a["account"]["label"].lower()),
+                "devices": self.devices(), "hidden_accounts": settings["hidden_accounts"],
                 "prefs": self.prefs(hosts)}
 
     def projects(self) -> list[dict]:
         def one(name):
             try:
-                return [{**p, "host": name} for p in self.clients[name].call("GET", "/api/projects")]
+                return [{**p, "host": name} for p in self.client(name).call("GET", "/api/projects")]
             except Exception:
                 return []
-        return [p for ps in self.pool.map(one, list(self.clients)) for p in ps]
+        return [p for ps in self.pool.map(one, self.active()) for p in ps]
 
     def prefs(self, hosts: list | None = None) -> dict:
-        """Prefs are written to every machine, so any machine's page shows the same Perplexity links.
-        Merged here (this machine first) in case one was offline during a write."""
-        hosts = hosts if hosts is not None else [self.last.get(n, {}) for n in self.clients]
+        """Perplexity links are written to every machine; merged here, this machine first."""
+        hosts = hosts if hosts is not None else [self.last.get(n, {}) for n in self.active()]
         merged: dict = {"perplexity": {}}
         for h in sorted(hosts, key=lambda h: h.get("name") != self.cfg["name"]):
             for section, values in (h.get("prefs") or {}).items():
@@ -222,18 +329,19 @@ class Hub:
 
     def set_pref(self, section: str, key: str, value) -> dict:
         body = {"section": section, "key": key, "value": value}
-        results = list(self.pool.map(lambda n: self._try(n, "POST", "/api/prefs", body), list(self.clients)))
-        mine = results[list(self.clients).index(self.cfg["name"])]
+        names = self.active()
+        results = list(self.pool.map(lambda n: self._try(n, "POST", "/api/prefs", body), names))
+        mine = results[names.index(self.cfg["name"])] if self.cfg["name"] in names else self.local.call("POST", "/api/prefs", None, body)
         if isinstance(mine, Exception):
             raise mine
-        for name, r in zip(self.clients, results):
+        for name, r in zip(names, results):
             if not isinstance(r, Exception):
                 self.last.setdefault(name, {"name": name})["prefs"] = r
         return self.prefs()
 
     def _try(self, name, method, path, body):
         try:
-            return self.clients[name].call(method, path, None, body)
+            return self.client(name).call(method, path, None, body)
         except Exception as e:
             return e
 
@@ -246,6 +354,10 @@ def dispatch_hub(hub: Hub, method: str, path: str, q: dict, body: dict):
             return hub.projects()
     if method == "POST" and path == "/hub/prefs":
         return hub.set_pref(body["section"], body["key"], body.get("value"))
+    if method == "POST" and path == "/hub/device":
+        return hub.set_device(body["name"], body.get("enabled"), body.get("via"), body.get("ssh"), body.get("python"))
+    if method == "POST" and path == "/hub/account":
+        return hub.set_account_hidden(body["key"], bool(body.get("hidden")))
     # /hub/<anything> with a host -> forward to that host's /api/<anything>
     host = q.pop("host", None) or body.pop("host", None)
     if not host:
