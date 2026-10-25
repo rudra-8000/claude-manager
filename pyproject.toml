@@ -1,0 +1,19 @@
+[project]
+name = "claude-manager"
+version = "0.1.0"
+description = "Drive Claude Code sessions in tmux/psmux on all your machines from one mobile-friendly page"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+cm = "cmgr.__main__:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["cmgr"]
+
+[tool.setuptools.package-data]
+cmgr = ["web/*"]

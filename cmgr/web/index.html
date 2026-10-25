@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+<meta name="theme-color" content="#16181d">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Claude Manager</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icon.svg">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+<div id="login" class="login" hidden>
+  <form id="login-form" class="login-card">
+    <h1>Claude Manager</h1>
+    <p>Paste the token from <code>~/.claude-manager/config.json</code> on any machine.</p>
+    <input id="login-token" type="password" autocomplete="current-password" placeholder="token" required>
+    <button class="btn primary" type="submit">Connect</button>
+    <p id="login-error" class="error" hidden></p>
+  </form>
+</div>
+
+<div id="app" class="app" hidden>
+  <aside id="side" class="side" aria-label="Accounts and machines">
+    <div class="side-head">
+      <span class="side-title">Usage</span>
+      <button class="icon-btn" id="side-close" aria-label="Close panel">✕</button>
+    </div>
+    <div id="accounts" class="accounts"></div>
+    <div class="side-head"><span class="side-title">Machines</span></div>
+    <div id="hosts" class="hosts"></div>
+    <div class="side-foot">
+      <button class="btn small ghost" id="notify-btn">Enable notifications</button>
+      <button class="btn small ghost" id="logout-btn">Forget token</button>
+    </div>
+  </aside>
+  <div id="scrim" class="scrim"></div>
+
+  <div class="main">
+    <section id="list-view" class="list-view">
+      <header class="topbar">
+        <button class="icon-btn" id="side-toggle" aria-label="Usage panel">☰</button>
+        <div class="topbar-title">Sessions <span id="sync-dot" class="sync-dot" title="last refresh"></span></div>
+        <button class="icon-btn" id="projects-btn" aria-label="Projects" title="Projects &amp; DECISIONS.md">▤</button>
+        <button class="icon-btn accent" id="new-btn" aria-label="New session" title="New session">＋</button>
+      </header>
+      <div class="filters" id="filters">
+        <button data-f="all" class="chip on">All</button>
+        <button data-f="waiting" class="chip">Needs you <b id="n-waiting"></b></button>
+        <button data-f="working" class="chip">Working <b id="n-working"></b></button>
+        <button data-f="idle" class="chip">Idle</button>
+        <label class="chip check"><input type="checkbox" id="show-shells"> shells</label>
+      </div>
+      <div id="sessions" class="sessions"></div>
+    </section>
+
+    <section id="session-view" class="session-view" hidden>
+      <header class="topbar">
+        <button class="icon-btn" id="back-btn" aria-label="Back">‹</button>
+        <div class="topbar-title stack">
+          <span id="s-title"></span>
+          <span id="s-meta" class="sub"></span>
+        </div>
+        <button class="icon-btn" id="fit-btn" title="Wrap / fit-to-width">↔</button>
+        <button class="icon-btn" id="font-down" title="Smaller text">A-</button>
+        <button class="icon-btn" id="font-up" title="Larger text">A+</button>
+      </header>
+      <div id="term-wrap" class="term-wrap">
+        <div id="term" class="term"></div>
+        <button id="jump-btn" class="jump" hidden>↓ latest</button>
+      </div>
+      <div class="keybar" id="keybar">
+        <button data-k="Escape">Esc</button>
+        <button data-k="Enter">⏎</button>
+        <button data-k="Up">↑</button>
+        <button data-k="Down">↓</button>
+        <button data-k="Tab">Tab</button>
+        <button data-k="BTab" title="Shift+Tab: cycle mode">⇧Tab</button>
+        <button data-k="1">1</button>
+        <button data-k="2">2</button>
+        <button data-k="3">3</button>
+        <button data-k="BSpace">⌫</button>
+        <button data-k="Left">←</button>
+        <button data-k="Right">→</button>
+        <button data-k="C-c" class="warn">^C</button>
+      </div>
+      <form id="composer" class="composer">
+        <textarea id="prompt" rows="1" placeholder="Prompt this session…" enterkeyhint="enter"></textarea>
+        <div class="composer-row">
+          <button type="button" class="btn small" id="dec-btn">DECISIONS</button>
+          <label class="tiny-check"><input type="checkbox" id="no-submit"> paste only</label>
+          <span id="prompt-count" class="muted small"></span>
+          <button type="submit" class="btn primary" id="send-btn">Send</button>
+        </div>
+      </form>
+    </section>
+
+    <section id="projects-view" class="list-view" hidden>
+      <header class="topbar">
+        <button class="icon-btn" id="projects-back" aria-label="Back">‹</button>
+        <div class="topbar-title">Projects</div>
+      </header>
+      <div id="projects" class="sessions"></div>
+    </section>
+  </div>
+</div>
+
+<div id="dec-sheet" class="sheet" hidden>
+  <div class="sheet-card" role="dialog" aria-modal="true" aria-labelledby="dec-title">
+    <header class="sheet-head">
+      <div class="stack">
+        <strong id="dec-title">DECISIONS.md</strong>
+        <span id="dec-path" class="sub"></span>
+      </div>
+      <button class="icon-btn" id="dec-close" aria-label="Close">✕</button>
+    </header>
+    <div class="pplx-row">
+      <input id="pplx-url" type="url" placeholder="Perplexity thread URL for this project" inputmode="url">
+      <a id="pplx-open" class="btn small" target="_blank" rel="noopener">Open</a>
+    </div>
+    <div class="lastn-row">
+      <span>Latest</span>
+      <button class="icon-btn" id="n-minus" aria-label="Fewer">−</button>
+      <input id="n-val" type="number" min="0" value="1" inputmode="numeric">
+      <button class="icon-btn" id="n-plus" aria-label="More">＋</button>
+      <span>entries</span>
+      <button class="btn small ghost" id="n-clear">none</button>
+    </div>
+    <div id="dec-list" class="dec-list"></div>
+    <footer class="sheet-foot">
+      <span id="dec-sum" class="muted small"></span>
+      <div class="sheet-actions">
+        <button class="btn" id="dec-copy">Copy</button>
+        <button class="btn" id="dec-pplx">Copy + Perplexity</button>
+        <button class="btn primary" id="dec-insert">Insert</button>
+      </div>
+    </footer>
+  </div>
+</div>
+
+<div id="new-sheet" class="sheet" hidden>
+  <form id="new-form" class="sheet-card small" role="dialog" aria-modal="true" aria-labelledby="new-title">
+    <header class="sheet-head">
+      <strong id="new-title">New Claude session</strong>
+      <button type="button" class="icon-btn" id="new-close" aria-label="Close">✕</button>
+    </header>
+    <div class="form">
+      <label>Machine <select id="new-host"></select></label>
+      <label>Account <select id="new-account"></select></label>
+      <label>Folder
+        <input id="new-cwd" list="new-cwd-list" placeholder="/home/me/project or C:\path" required>
+        <datalist id="new-cwd-list"></datalist>
+      </label>
+      <label>tmux session name <input id="new-name" placeholder="defaults to folder name"></label>
+      <label class="tiny-check"><input type="checkbox" id="new-resume"> continue the last conversation in this folder</label>
+      <p id="new-error" class="error" hidden></p>
+      <button class="btn primary" type="submit">Start</button>
+    </div>
+  </form>
+</div>
+
+<div id="toasts" class="toasts" aria-live="polite"></div>
+<script src="app.js"></script>
+</body>
+</html>
