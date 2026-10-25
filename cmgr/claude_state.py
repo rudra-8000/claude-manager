@@ -155,24 +155,25 @@ class ClaudeProc:
     tmux_pane: str = ""
     updated_at: float = 0.0
     bridge_session_id: str = ""   # set when Remote Control is on for this session
+    kind: str = ""                # "interactive" or "bg" (a Claude Code background session)
 
     def to_dict(self) -> dict:
         return {"pid": self.pid, "session_id": self.session_id, "name": self.name, "cwd": self.cwd,
                 "status": self.status, "version": self.version, "started_at": self.started_at,
-                "updated_at": self.updated_at, "account_dir": self.account_dir,
+                "updated_at": self.updated_at, "account_dir": self.account_dir, "kind": self.kind,
+                "in_tmux": bool(self.tmux_pane),
                 "remote_url": f"https://claude.ai/code/{self.bridge_session_id}" if self.bridge_session_id else ""}
 
 
 def read_registry(accounts: list[Account], check_alive=pid_alive) -> list[ClaudeProc]:
+    """Every live Claude Code process: in tmux (drivable) or not (terminal tabs, background sessions)."""
     procs = []
     for acct in accounts:
         for f in glob.glob(os.path.join(acct.dir, "sessions", "*.json")):
             j = _read_json(f)
-            if not isinstance(j, dict) or not j.get("tmux"):
-                continue  # only sessions running inside tmux can be driven
-            m = _TMUX_REF.match(str(j["tmux"]))
-            if not m:
+            if not isinstance(j, dict):
                 continue
+            m = _TMUX_REF.match(str(j.get("tmux") or ""))
             pid = int(j.get("pid") or 0)
             if not check_alive(pid):
                 continue
@@ -180,8 +181,9 @@ def read_registry(accounts: list[Account], check_alive=pid_alive) -> list[Claude
                 pid=pid, session_id=j.get("sessionId", ""), name=j.get("name", ""), cwd=j.get("cwd", ""),
                 status=j.get("status", ""), version=j.get("version", ""),
                 started_at=(j.get("startedAt") or 0) / 1000, updated_at=(j.get("statusUpdatedAt") or 0) / 1000,
-                account_dir=acct.dir, tmux_session=m["session"], tmux_window=m["window"], tmux_pane=m["pane"],
-                bridge_session_id=str(j.get("bridgeSessionId") or ""),
+                account_dir=acct.dir, tmux_session=m["session"] if m else "", tmux_window=m["window"] if m else "",
+                tmux_pane=m["pane"] if m else "", bridge_session_id=str(j.get("bridgeSessionId") or ""),
+                kind=str(j.get("kind") or ""),
             ))
     return procs
 
@@ -212,7 +214,7 @@ def known_projects(accounts: list[Account]) -> list[dict]:
 
 
 def match_proc(pane, procs: list[ClaudeProc]) -> ClaudeProc | None:
-    hits = [p for p in procs if p.tmux_session == pane.session and p.tmux_pane == pane.pane_id]
+    hits = [p for p in procs if p.tmux_pane and p.tmux_session == pane.session and p.tmux_pane == pane.pane_id]
     return max(hits, key=lambda p: p.started_at) if hits else None
 
 

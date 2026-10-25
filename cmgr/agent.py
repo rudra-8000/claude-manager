@@ -97,7 +97,26 @@ class Agent:
             elif p.dead:
                 d["status"] = "dead"
             out.append(d)
+        matched = {s["claude"]["pid"] for s in out if s["claude"]}
+        for proc in procs:   # live Claude sessions outside tmux: readable (chat), not drivable
+            if proc.pid not in matched:
+                out.append(self._external(proc, procs, by_dir))
         return out
+
+    REGISTRY_STATUS = {"busy": "working", "shell": "working", "idle": "idle"}
+
+    def _external(self, proc, procs, by_dir) -> dict:
+        dec = self._decisions_for(proc.cwd)
+        acct = by_dir.get(proc.account_dir)
+        return {
+            "target": f"proc:{proc.pid}", "session": proc.name or proc.session_id[:8], "external": True,
+            "kind": proc.kind or "interactive", "is_claude": True, "dead": False,
+            "claude": proc.to_dict(), "account": acct.to_dict() if acct else None, "cwd": proc.cwd,
+            "decisions_path": dec,
+            "project": os.path.basename(os.path.dirname(dec)) if dec else os.path.basename(proc.cwd.rstrip("\\/")),
+            "status": self.REGISTRY_STATUS.get(proc.status, "idle"),
+            "preview": self._chat_preview(proc, procs), "width": 0, "height": 0,
+        }
 
     @staticmethod
     def _transcript_path(proc, procs) -> str | None:
@@ -115,6 +134,9 @@ class Agent:
             return ""
 
     def _check_target(self, target: str):
+        if target.startswith("proc:"):
+            raise AgentError("this session isn't running in tmux, so it can only be read here; "
+                             "reply to it in its own terminal, or with ☁ in the Claude app if Remote Control is on", 409)
         for p in self.mux.list_panes():
             if p.target == target:
                 return p
@@ -129,9 +151,14 @@ class Agent:
                 "status": screen_status(visible)}
 
     def transcript(self, target: str, before: int | None = None, since: int | None = None) -> dict:
-        p = self._check_target(target)
         procs = read_registry(self.accounts())
-        proc = match_proc(p, procs)
+        if target.startswith("proc:"):
+            pid = int(target[5:]) if target[5:].isdigit() else -1
+            proc = next((q for q in procs if q.pid == pid), None)
+            if not proc:
+                raise AgentError("that Claude session has ended", 404)
+        else:
+            proc = match_proc(self._check_target(target), procs)
         if not proc:
             raise AgentError("no Claude Code session recorded for this pane", 404)
         path = self._transcript_path(proc, procs)

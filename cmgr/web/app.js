@@ -163,7 +163,7 @@ function renderSessions() {
     if (!items.length) { html += `<div class="muted small" style="padding:0 6px">no Claude sessions</div>`; continue; }
     html += items.map((s) => {
       const active = S.current && S.current.host === s.host && S.current.target === s.target;
-      const meta = [shortAcct(s.account), "tmux " + s.target].filter(Boolean).map(esc).join(" · ");
+      const meta = [shortAcct(s.account), where(s)].filter(Boolean).map(esc).join(" · ");
       return `<button class="card${active ? " active" : ""}" data-host="${esc(s.host)}" data-target="${esc(s.target)}">
         <span class="dot ${esc(s.status)}"></span><span class="title">${esc(s.project || s.session)}</span>
         <span class="badge ${esc(s.status)}">${esc(STATUS_LABEL[s.status] || s.status)}</span>
@@ -393,15 +393,31 @@ function renderSessionHeader() {
   const s = findSession(S.current.host, S.current.target);
   $("#s-title").textContent = s ? (s.project || s.session) : S.current.target;
   $("#s-meta").textContent = s
-    ? [STATUS_LABEL[s.status] || s.status, S.current.host, shortAcct(s.account), "tmux " + s.target].filter(Boolean).join(" · ")
+    ? [STATUS_LABEL[s.status] || s.status, S.current.host, shortAcct(s.account), where(s)].filter(Boolean).join(" · ")
     : S.current.host + " · " + S.current.target;
+  // sessions outside tmux: the chat can be read, but nothing can be typed into them from here
+  const ext = isExternal();
+  $(".tab[data-tab=screen]").hidden = ext;
+  $("#keybar").hidden = ext;
+  $("#composer").hidden = ext;
+  $("#external-note").hidden = !ext;
+  if (ext) {
+    const rc = s && s.claude && s.claude.remote_url;
+    $("#external-note").innerHTML = `${s && s.kind === "bg" ? "A Claude Code background session" : "Running in a terminal outside tmux"}, so it can only be read here.
+      ${rc ? `<a class="btn small primary" href="${esc(rc)}" target="_blank" rel="noopener">☁ Reply in the Claude app</a>`
+           : `To prompt it from here, start it inside tmux next time.`}
+      ${s && s.decisions_path ? `<button class="btn small" data-act="ext-dec">DECISIONS</button>` : ""}`;
+  }
   const rc = s && s.claude && s.claude.remote_url;
   $("#rc-btn").hidden = !rc;
   if (rc) $("#rc-btn").href = rc;
   $("#dec-btn").disabled = !(s && s.decisions_path);
   $("#dec-btn").title = s && s.decisions_path ? s.decisions_path : "No DECISIONS.md found at or above this folder";
 }
+const isExternal = () => !!(S.current && S.current.target.startsWith("proc:"));
+const where = (s) => (s.external ? (s.kind === "bg" ? "background session" : "terminal, not tmux") : "tmux " + s.target);
 function setTab(tab) {
+  if (isExternal()) tab = "chat";
   S.tab = tab; store.set("tab", tab);
   $$(".tab").forEach((b) => b.classList.toggle("on", b.dataset.tab === tab));
   $("#chat").hidden = tab !== "chat";
@@ -506,7 +522,7 @@ function toolHtml(t, res, open) {
 // ---- screen
 async function pollPane(force) {
   clearTimeout(paneTimer);
-  if (!S.current) return;
+  if (!S.current || isExternal()) return;
   const cur = S.current;
   if (!document.hidden) {
     try {
@@ -909,6 +925,11 @@ function bind() {
     if (S.current) store.set("draft:" + S.current.host + ":" + S.current.target, $("#prompt").value);
   });
   $("#prompt").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) sendPrompt(e); });
+  $("#external-note").onclick = (e) => {
+    if (!e.target.closest("[data-act=ext-dec]")) return;
+    const s = S.current && findSession(S.current.host, S.current.target);
+    if (s && s.decisions_path) openDecisions(s.host, s.decisions_path, false);
+  };
   $("#dec-btn").onclick = () => {
     const s = S.current && findSession(S.current.host, S.current.target);
     if (s && s.decisions_path) openDecisions(s.host, s.decisions_path, true);

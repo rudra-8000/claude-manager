@@ -209,3 +209,33 @@ class FindTests(unittest.TestCase):
             c = os.path.join(pdir, "C.jsonl")                                   # A ran /clear: its new file is followed
             open(c, "w").close()
             self.assertEqual(T.find(d, "/w/openpi", "A", 0, others={"B"}), c)
+
+
+class ExternalSessionTests(unittest.TestCase):
+    def test_sessions_outside_tmux_are_listed_and_readable_but_not_drivable(self):
+        from cmgr.agent import AgentError
+        from cmgr.claude_state import Account
+        with tempfile.TemporaryDirectory() as d:
+            acct = os.path.join(d, ".claude")
+            os.makedirs(os.path.join(acct, "sessions"))
+            cwd = os.path.join(d, "proj")
+            os.makedirs(cwd)
+            pdir = os.path.join(acct, "projects", T.encode_cwd(cwd))
+            os.makedirs(pdir)
+            with open(os.path.join(pdir, "S1.jsonl"), "w", encoding="utf-8") as f:
+                f.write("\n".join(TRANSCRIPT) + "\n")
+            me = os.getpid()   # a pid that is certainly alive
+            with open(os.path.join(acct, "sessions", f"{me}.json"), "w") as f:
+                json.dump({"pid": me, "sessionId": "S1", "cwd": cwd, "kind": "bg", "status": "busy",
+                           "startedAt": 0, "bridgeSessionId": "session_X"}, f)
+            agent = Agent({"name": "t", "accounts": [{"dir": acct}], "project_roots": [], "tmux": ""}, mux=FakeMux("work"))
+            ext = [s for s in agent.sessions() if s.get("external")]
+            self.assertEqual(len(ext), 1)
+            s = ext[0]
+            self.assertEqual((s["target"], s["kind"], s["status"], s["project"], s["preview"]),
+                             (f"proc:{me}", "bg", "working", "proj", "Fixed."))
+            self.assertEqual(s["claude"]["remote_url"], "https://claude.ai/code/session_X")
+            self.assertEqual(agent.transcript(s["target"])["items"][-1]["text"], "Fixed.")
+            with self.assertRaises(AgentError) as cm:
+                agent.send(s["target"], "hi")
+            self.assertEqual(cm.exception.status, 409)

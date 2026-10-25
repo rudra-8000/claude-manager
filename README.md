@@ -51,6 +51,10 @@ more, and the example peers (`labpc`, `winbox`) in it aren't real.
 
 ## What it does
 
+- **Which sessions show up:** every running Claude Code session on each device, found from Claude Code's own session
+  registry, not by scanning folders. Sessions in tmux/psmux can be driven from the page. Sessions outside tmux (a
+  plain terminal tab, or Claude Code background sessions) are listed read-only: you get the full chat, and a
+  *Reply in the Claude app* button when Remote Control is on for them. Start a session inside tmux to prompt it here.
 - **Sessions list:** grouped by device. Each session shows its status (needs you / working / idle), project,
   account and last line. "Needs you" means a permission prompt, a question or a "trust this folder?" dialog is
   on screen. Alerts fire when a session starts waiting for you or finishes.
@@ -146,7 +150,7 @@ from localhost.
 ## Development
 
 ```bash
-python -m pytest -q tests      # 55 tests
+python -m pytest -q tests      # 56 tests
 ```
 
 Architecture decisions are recorded in [DECISIONS.md](DECISIONS.md).

@@ -38,6 +38,7 @@ def find(account_dir: str, cwd: str, session_id: str, started_at: float = 0.0, o
 
 
 _CMD = re.compile(r"<command-name>(.*?)</command-name>.*?(?:<command-args>(.*?)</command-args>)?", re.S)
+_PASTE_TAG = re.compile(r"^[ \t]*</?pasted_content\b[^>\n]*>[ \t]*\n?", re.M)
 _NOISE = re.compile(r"^\s*<(local-command-caveat|local-command-stdout|system-reminder|bash-stdout|bash-stderr)\b", re.S)
 
 
@@ -88,6 +89,7 @@ def parse_lines(lines: list[str]) -> list[dict]:
                 continue
             if not text.strip() or _NOISE.match(text):
                 continue
+            text = _PASTE_TAG.sub("", text).strip("\n")   # keep pasted text, drop its wrapper tags
             items.append({"kind": "user", "text": text, "ts": ts})
         else:
             for b in content if isinstance(content, list) else []:
