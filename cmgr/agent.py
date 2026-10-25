@@ -3,6 +3,7 @@ usage for the accounts on this machine, and DECISIONS.md files."""
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import platform
 import sys
@@ -10,7 +11,7 @@ import threading
 import time
 
 from . import __version__
-from .claude_state import (UsageTracker, discover_accounts, expand, last_text_line, match_proc,
+from .claude_state import (UsageTracker, discover_accounts, expand, known_projects, last_text_line, match_proc,
                            read_registry, screen_status)
 from .decisions import DecisionsCache, find_file, find_in_dir
 from .mux import Mux, MuxError
@@ -143,6 +144,37 @@ class Agent:
         sname = self.mux.new_session(name or os.path.basename(cwd.rstrip("\\/")), cwd, env, cmd)
         return {"ok": True, "session": sname}
 
+    # ------------------------------------------------------------ prefs (Perplexity thread per project)
+    PREF_SECTIONS = ("perplexity", "labels")
+
+    def _prefs_path(self) -> str:
+        return os.path.join(os.path.dirname(self.cfg.get("_path") or os.path.expanduser("~/.claude-manager/x")),
+                            "hub-prefs.json")
+
+    def prefs(self) -> dict:
+        try:
+            with open(self._prefs_path(), encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return {"perplexity": {}}
+
+    def set_pref(self, section: str, key: str, value) -> dict:
+        if section not in self.PREF_SECTIONS:
+            raise AgentError("unknown prefs section")
+        with self._lock:
+            p = self.prefs()
+            sec = p.setdefault(section, {})
+            if value in (None, ""):
+                sec.pop(key, None)
+            else:
+                sec[key] = value
+            path = self._prefs_path()
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path + ".tmp", "w", encoding="utf-8") as f:
+                json.dump(p, f, indent=2)
+            os.replace(path + ".tmp", path)
+        return p
+
     # ------------------------------------------------------------ usage
     def usage(self) -> list[dict]:
         return [self.usage_tracker.get(a) for a in self.accounts()]
@@ -167,12 +199,17 @@ class Agent:
     def projects(self) -> list[dict]:
         seen, out = set(), []
 
-        def add(d: str, dec: str | None):
+        def add(d: str, dec: str | None, last_used: float = 0.0):
             key = os.path.normcase(d)
             if key in seen:
                 return
             seen.add(key)
-            out.append({"name": os.path.basename(d.rstrip("\\/")) or d, "dir": d, "decisions_path": dec})
+            out.append({"name": os.path.basename(d.rstrip("\\/")) or d, "dir": d, "decisions_path": dec,
+                        "last_used": last_used})
+
+        # folders Claude Code itself has been used in - no configuration needed
+        for p in known_projects(self.accounts()):
+            add(p["dir"], find_in_dir(p["dir"]), p["last_used"])
 
         for root in self.cfg.get("project_roots") or []:
             root = expand(root)

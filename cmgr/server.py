@@ -7,6 +7,7 @@ import hmac
 import json
 import mimetypes
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -19,6 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .agent import Agent, AgentError
 from .mux import MuxError
+from .tailscale import Tailscale, is_loopback
 
 WEB_DIR = os.path.join(os.path.dirname(__file__), "web")
 PEER_TIMEOUT = 6.0
@@ -49,9 +51,10 @@ class RemoteClient:
              timeout: float = PEER_TIMEOUT):
         url = self.url + path + ("?" + urllib.parse.urlencode(params) if params else "")
         data = json.dumps(body).encode() if body is not None else None
-        req = urllib.request.Request(url, data=data, method=method, headers={
-            "Authorization": f"Bearer {self.token}", "Content-Type": "application/json",
-            "Accept-Encoding": "gzip"})
+        headers = {"Content-Type": "application/json", "Accept-Encoding": "gzip"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        req = urllib.request.Request(url, data=data, method=method, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 raw = r.read()
@@ -79,7 +82,8 @@ def dispatch_agent(agent: Agent, method: str, path: str, q: dict, body: dict):
         if path == "/api/info":
             return agent.info()
         if path == "/api/snapshot":
-            return {"info": agent.info(), "sessions": agent.sessions(), "usage": agent.usage(), "time": time.time()}
+            return {"info": agent.info(), "sessions": agent.sessions(), "usage": agent.usage(),
+                    "prefs": agent.prefs(), "time": time.time()}
         if path == "/api/sessions":
             return agent.sessions()
         if path == "/api/pane":
@@ -97,6 +101,8 @@ def dispatch_agent(agent: Agent, method: str, path: str, q: dict, body: dict):
             return agent.send(body["target"], body.get("text", ""), bool(body.get("submit", True)))
         if path == "/api/keys":
             return agent.keys(body["target"], body.get("keys") or [], body.get("literal", ""))
+        if path == "/api/prefs":
+            return agent.set_pref(body["section"], body["key"], body.get("value"))
         if path == "/api/new":
             return agent.new_session(body["cwd"], body.get("account_dir", ""), body.get("name", ""),
                                      bool(body.get("resume", False)))
@@ -105,16 +111,53 @@ def dispatch_agent(agent: Agent, method: str, path: str, q: dict, body: dict):
 
 # ---------------------------------------------------------------- hub
 
+DISCOVER_EVERY = 60.0
+
+
 class Hub:
-    def __init__(self, cfg: dict, agent: Agent):
+    def __init__(self, cfg: dict, agent: Agent, ts: Tailscale | None = None):
         self.cfg = cfg
+        self.ts = ts or Tailscale()
         self.clients: dict[str, LocalClient | RemoteClient] = {cfg["name"]: LocalClient(agent)}
         for peer in cfg.get("peers") or []:
-            self.clients[peer["name"]] = RemoteClient(peer["url"], peer.get("token") or cfg["token"])
-        self.pool = ThreadPoolExecutor(max_workers=max(4, 2 * len(self.clients)))
+            self.clients[peer["name"]] = RemoteClient(peer["url"], peer.get("token") or cfg.get("token", ""))
+        self.pool = ThreadPoolExecutor(max_workers=16)
         self.last: dict[str, dict] = {}
-        self.prefs_path = os.path.join(os.path.dirname(cfg["_path"]), "hub-prefs.json")
-        self._prefs_lock = threading.Lock()
+        self.discovered_at = 0.0
+        self._discover_lock = threading.Lock()
+
+    def discover(self, force: bool = False) -> None:
+        """Find `cm serve` on every online machine of my Tailscale user by probing its /api/info."""
+        if not self.cfg.get("discover", True):
+            return
+        if not force and time.time() - self.discovered_at < DISCOVER_EVERY:
+            return
+        if not self._discover_lock.acquire(blocking=False):
+            return
+        try:
+            known_urls = {c.url for c in self.clients.values() if isinstance(c, RemoteClient)}
+            port = int(self.cfg["port"])
+
+            def probe(m):
+                url = f"http://{m['ip']}:{port}"
+                if url in known_urls:
+                    return None
+                c = RemoteClient(url, self.cfg.get("token", ""))
+                try:
+                    info = c.call("GET", "/api/info", timeout=2.5)
+                    return (info.get("name") or m["name"], c)
+                except Exception:
+                    return None
+
+            for hit in self.pool.map(probe, self.ts.my_machines()):
+                if hit:
+                    name, c = hit
+                    if name in self.clients:  # two machines with one hostname
+                        name = f"{name} ({c.url.split('//')[1].split(':')[0]})"
+                    self.clients[name] = c
+            self.discovered_at = time.time()
+        finally:
+            self._discover_lock.release()
 
     def client(self, host: str):
         c = self.clients.get(host)
@@ -136,6 +179,7 @@ class Hub:
         return entry
 
     def state(self) -> dict:
+        self.discover()
         hosts = list(self.pool.map(self._snap, list(self.clients)))
         accounts: dict[str, dict] = {}
         for h in hosts:
@@ -155,7 +199,7 @@ class Hub:
                     accounts[key]["account"] = {**accounts[key]["account"], "names": names, "label": " / ".join(names)}
         return {"time": time.time(), "hub": self.cfg["name"], "hosts": hosts,
                 "accounts": sorted(accounts.values(), key=lambda a: a["account"]["label"].lower()),
-                "prefs": self.prefs()}
+                "prefs": self.prefs(hosts)}
 
     def projects(self) -> list[dict]:
         def one(name):
@@ -165,28 +209,33 @@ class Hub:
                 return []
         return [p for ps in self.pool.map(one, list(self.clients)) for p in ps]
 
-    def prefs(self) -> dict:
-        try:
-            with open(self.prefs_path, encoding="utf-8") as f:
-                return json.load(f)
-        except (OSError, ValueError):
-            return {"perplexity": {}}
+    def prefs(self, hosts: list | None = None) -> dict:
+        """Prefs are written to every machine, so any machine's page shows the same Perplexity links.
+        Merged here (this machine first) in case one was offline during a write."""
+        hosts = hosts if hosts is not None else [self.last.get(n, {}) for n in self.clients]
+        merged: dict = {"perplexity": {}}
+        for h in sorted(hosts, key=lambda h: h.get("name") != self.cfg["name"]):
+            for section, values in (h.get("prefs") or {}).items():
+                for k, v in (values or {}).items():
+                    merged.setdefault(section, {}).setdefault(k, v)
+        return merged
 
     def set_pref(self, section: str, key: str, value) -> dict:
-        if section not in ("perplexity", "labels"):
-            raise AgentError("unknown prefs section")
-        with self._prefs_lock:
-            p = self.prefs()
-            sec = p.setdefault(section, {})
-            if value in (None, ""):
-                sec.pop(key, None)
-            else:
-                sec[key] = value
-            tmp = self.prefs_path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(p, f, indent=2)
-            os.replace(tmp, self.prefs_path)
-        return p
+        body = {"section": section, "key": key, "value": value}
+        results = list(self.pool.map(lambda n: self._try(n, "POST", "/api/prefs", body), list(self.clients)))
+        mine = results[list(self.clients).index(self.cfg["name"])]
+        if isinstance(mine, Exception):
+            raise mine
+        for name, r in zip(self.clients, results):
+            if not isinstance(r, Exception):
+                self.last.setdefault(name, {"name": name})["prefs"] = r
+        return self.prefs()
+
+    def _try(self, name, method, path, body):
+        try:
+            return self.clients[name].call(method, path, None, body)
+        except Exception as e:
+            return e
 
 
 def dispatch_hub(hub: Hub, method: str, path: str, q: dict, body: dict):
@@ -208,8 +257,37 @@ def dispatch_hub(hub: Hub, method: str, path: str, q: dict, body: dict):
 
 # ---------------------------------------------------------------- HTTP handler
 
-def make_handler(cfg: dict, agent: Agent, hub: Hub | None):
-    token = cfg["token"]
+class Authorizer:
+    """Who may call /api and /hub:
+    - anyone presenting the configured token (the token is optional);
+    - devices owned by my own Tailscale user (checked with `tailscale whois`), so my phone and my
+      other machines need no token;
+    - this machine itself (loopback or its own Tailscale IP) only with trust_local, which defaults to
+      true on Windows/macOS and false on Linux, where the box may be shared with other users."""
+
+    def __init__(self, cfg: dict, ts: Tailscale):
+        self.token = cfg.get("token") or ""
+        self.ts = ts
+        tl = cfg.get("trust_local")
+        self.trust_local = (sys.platform != "linux") if tl is None else bool(tl)
+        self.allow_tailscale = cfg.get("allow_tailscale", True)
+
+    def check(self, ip: str, presented: str) -> tuple[bool, str]:
+        if self.token and presented and hmac.compare_digest(presented.encode(), self.token.encode()):
+            return True, ""
+        if is_loopback(ip) or ip in self.ts.my_ips():
+            if self.trust_local:
+                return True, ""
+            return False, "connections from this machine itself need the token here (or set trust_local)"
+        if self.allow_tailscale:
+            me = self.ts.my_user()
+            if me is not None and self.ts.owner_of(ip) == me:
+                return True, ""
+        return False, "not one of your Tailscale devices, and no valid token"
+
+
+def make_handler(cfg: dict, agent: Agent, hub: Hub | None, auth: Authorizer | None = None):
+    auth = auth or Authorizer(cfg, hub.ts if hub else Tailscale())
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "claude-manager"
@@ -218,10 +296,10 @@ def make_handler(cfg: dict, agent: Agent, hub: Hub | None):
         def log_message(self, fmt, *args):  # quiet; errors still go to stderr below
             pass
 
-        def _authed(self) -> bool:
+        def _authed(self) -> tuple[bool, str]:
             got = self.headers.get("Authorization", "")
             got = got[7:] if got.startswith("Bearer ") else self.headers.get("X-CM-Token", "")
-            return bool(token) and hmac.compare_digest(got.encode(), token.encode())
+            return auth.check(self.client_address[0], got)
 
         def _send(self, status: int, payload: bytes, ctype: str, cache: str = "no-store"):
             if len(payload) > 1024 and "gzip" in self.headers.get("Accept-Encoding", ""):
@@ -262,8 +340,9 @@ def make_handler(cfg: dict, agent: Agent, hub: Hub | None):
                 if method == "GET":
                     return self._static(path)
                 return self._json(404, {"error": "not found"})
-            if not self._authed():
-                return self._json(401, {"error": "bad or missing token"})
+            ok, why = self._authed()
+            if not ok:
+                return self._json(401, {"error": why})
             q = {k: v[-1] for k, v in urllib.parse.parse_qs(u.query).items()}
             body = {}
             if method == "POST":
@@ -309,7 +388,7 @@ def tailscale_ip() -> str | None:
             out = subprocess.run([exe, "ip", "-4"], capture_output=True, text=True, timeout=5,
                                  creationflags=0x08000000 if sys.platform == "win32" else 0).stdout
             ip = out.strip().splitlines()[0] if out.strip() else ""
-            if ip:
+            if re.fullmatch(r"\d+\.\d+\.\d+\.\d+", ip):  # not "no current Tailscale IPs; state: ..."
                 return ip
         except (OSError, subprocess.SubprocessError):
             continue
@@ -331,23 +410,30 @@ def resolve_binds(binds: list[str]) -> list[str]:
 
 
 def serve(cfg: dict, agent: Agent | None = None) -> None:
-    if not cfg.get("token"):
-        raise SystemExit("config has no token; run `cm init` first")
     agent = agent or Agent(cfg)
-    hub = Hub(cfg, agent) if cfg.get("hub") else None
-    handler = make_handler(cfg, agent, hub)
+    ts = Tailscale()
+    hub = Hub(cfg, agent, ts) if cfg.get("hub") else None
+    handler = make_handler(cfg, agent, hub, Authorizer(cfg, ts))
     servers = []
     for addr in resolve_binds(cfg["bind"]):
-        srv = ThreadingHTTPServer((addr, int(cfg["port"])), handler)
+        try:
+            srv = ThreadingHTTPServer((addr, int(cfg["port"])), handler)
+        except OSError as e:
+            print(f"[cm] warning: cannot listen on {addr}:{cfg['port']} ({e.strerror or e}); "
+                  "another program probably has that port - skipping it", file=sys.stderr)
+            continue
         srv.daemon_threads = True
         servers.append(srv)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
-        print(f"[cm] {cfg['name']}: listening on http://{addr}:{cfg['port']}" + (" (hub + UI)" if hub else ""))
+        print(f"[cm] {cfg['name']}: listening on http://{addr}:{cfg['port']}" + (" (UI)" if hub else ""))
     if not servers:
-        raise SystemExit("nothing to listen on")
+        raise SystemExit(f"[cm] could not listen anywhere on port {cfg['port']}; pick another with "
+                         "`cm serve --port 8766` (the same port on every machine)")
+    if hub:
+        threading.Thread(target=hub.discover, kwargs={"force": True}, daemon=True).start()
     try:
         while True:
             time.sleep(3600)
     except KeyboardInterrupt:
-        for s in servers:
-            s.shutdown()
+        for srv in servers:
+            srv.shutdown()

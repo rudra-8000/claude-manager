@@ -328,6 +328,9 @@ function renderSessionHeader() {
   $("#s-meta").textContent = s
     ? [STATUS_LABEL[s.status] || s.status, S.current.host, shortAcct(s.account), "tmux " + s.target].filter(Boolean).join(" · ")
     : S.current.host + " · " + S.current.target;
+  const rc = s && s.claude && s.claude.remote_url;
+  $("#rc-btn").hidden = !rc;
+  if (rc) $("#rc-btn").href = rc;
   $("#dec-btn").disabled = !(s && s.decisions_path);
   $("#dec-btn").title = s && s.decisions_path ? s.decisions_path : "No DECISIONS.md found at or above this folder";
 }
@@ -530,10 +533,10 @@ async function loadProjects() {
     add({ host: s.host, name: s.project, dir, decisions_path: s.decisions_path });
   }
   S.projects.forEach(add);
-  rows.sort((a, b) => (!!b.decisions_path - !!a.decisions_path) || a.name.localeCompare(b.name));
+  rows.sort((a, b) => (b.last_used || 0) - (a.last_used || 0) || (!!b.decisions_path - !!a.decisions_path) || a.name.localeCompare(b.name));
   box.innerHTML = rows.length ? rows.map((p, i) => `<div class="card" data-pi="${i}" style="cursor:default">
       <span class="dot ${p.decisions_path ? "idle" : "shell"}"></span><span class="title">${esc(p.name)}</span><span class="badge">${esc(p.host)}</span>
-      <span class="meta">${esc(p.dir)}</span>
+      <span class="meta">${p.last_used ? "used " + esc(rel(p.last_used)) + " · " : ""}${esc(p.dir)}</span>
       <div class="actions">${p.decisions_path ? `<button class="btn small" data-act="dec">DECISIONS</button>` : `<span class="muted small">no DECISIONS.md</span>`}
       <button class="btn small" data-act="new">New session here</button></div></div>`).join("")
     : `<div class="empty">No projects yet. Add folders to <code>project_roots</code> in each machine's config.</div>`;
@@ -589,7 +592,7 @@ async function start() {
   try {
     S.state = await api("GET", "/hub/state");
   } catch (e) {
-    return showLogin(e.status === 401 ? (S.token ? "Token rejected." : "") : "Cannot reach the hub: " + e.message);
+    return showLogin(e.status === 401 ? e.message + (S.token ? " (the saved token was rejected)" : "") : "Cannot reach the server: " + e.message);
   }
   $("#login").hidden = true; $("#app").hidden = false;
   if (store.get("sideCollapsed", false) && innerWidth >= 900) $("#app").classList.add("side-collapsed");

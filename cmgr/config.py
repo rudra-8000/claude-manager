@@ -10,13 +10,15 @@ DEFAULT_PORT = 8765
 
 DEFAULTS = {
     "name": "",                  # host label in the UI; defaults to the hostname
-    "token": "",                 # shared secret, same on every machine
+    "token": "",                 # optional shared secret; Tailscale identity is enough without it
     "port": DEFAULT_PORT,
     "bind": ["tailscale", "127.0.0.1"],  # "tailscale" = this machine's Tailscale IPv4
-    "hub": True,                 # serve the web UI and aggregate the peers below
-    "peers": [],                 # [{"name": "lab-pc", "url": "http://lab-pc:8765"}]
+    "hub": True,                 # serve the web UI and show the other machines
+    "discover": True,            # find the other machines through Tailscale (your own devices only)
+    "peers": [],                 # extra machines Tailscale can't find: [{"name": "x", "url": "http://x:8765"}]
+    "trust_local": None,         # None = trust this machine's own connections on Windows/macOS, not on Linux
     "accounts": [],              # [] = auto-discover ~/.claude and ~/.claude-*
-    "project_roots": [],         # directories whose sub-folders are scanned for DECISIONS.md
+    "project_roots": [],         # optional; folders you used Claude Code in are listed automatically
     "tmux": "",                  # tmux binary; "" = tmux (or psmux) from PATH
     "claude_command": "claude",  # what new sessions run
 }
@@ -48,7 +50,7 @@ def write_initial(path: str | None = None, token: str | None = None, **overrides
     os.makedirs(os.path.dirname(path), exist_ok=True)
     cfg = {k: v for k, v in DEFAULTS.items()}
     cfg["name"] = socket.gethostname()
-    cfg["token"] = token or secrets.token_urlsafe(24)
+    cfg["token"] = token if token is not None else secrets.token_urlsafe(24)
     cfg.update(overrides)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)

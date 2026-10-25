@@ -154,11 +154,13 @@ class ClaudeProc:
     tmux_window: str = ""
     tmux_pane: str = ""
     updated_at: float = 0.0
+    bridge_session_id: str = ""   # set when Remote Control is on for this session
 
     def to_dict(self) -> dict:
         return {"pid": self.pid, "session_id": self.session_id, "name": self.name, "cwd": self.cwd,
                 "status": self.status, "version": self.version, "started_at": self.started_at,
-                "updated_at": self.updated_at, "account_dir": self.account_dir}
+                "updated_at": self.updated_at, "account_dir": self.account_dir,
+                "remote_url": f"https://claude.ai/code/{self.bridge_session_id}" if self.bridge_session_id else ""}
 
 
 def read_registry(accounts: list[Account], check_alive=pid_alive) -> list[ClaudeProc]:
@@ -179,8 +181,34 @@ def read_registry(accounts: list[Account], check_alive=pid_alive) -> list[Claude
                 status=j.get("status", ""), version=j.get("version", ""),
                 started_at=(j.get("startedAt") or 0) / 1000, updated_at=(j.get("statusUpdatedAt") or 0) / 1000,
                 account_dir=acct.dir, tmux_session=m["session"], tmux_window=m["window"], tmux_pane=m["pane"],
+                bridge_session_id=str(j.get("bridgeSessionId") or ""),
             ))
     return procs
+
+
+def _profile_paths(acct: Account) -> list[str]:
+    return ([expand("~/.claude.json")] if acct.is_default else []) + [os.path.join(acct.dir, ".claude.json")]
+
+
+def known_projects(accounts: list[Account]) -> list[dict]:
+    """Every folder Claude Code has been used in, on any account (from its own .claude.json), newest first.
+    Last use = mtime of <config>/projects/<path with non-alphanumerics as '-'>, where transcripts live."""
+    found: dict[str, dict] = {}
+    for acct in accounts:
+        for prof in _profile_paths(acct):
+            for path in ((_read_json(prof) or {}).get("projects") or {}):
+                if not os.path.isdir(path):
+                    continue
+                enc = re.sub(r"[^A-Za-z0-9]", "-", path)
+                try:
+                    used = os.path.getmtime(os.path.join(acct.dir, "projects", enc))
+                except OSError:
+                    used = 0.0
+                key = os.path.normcase(os.path.normpath(path))
+                cur = found.get(key)
+                if cur is None or used > cur["last_used"]:
+                    found[key] = {"dir": os.path.normpath(path), "last_used": used}
+    return sorted(found.values(), key=lambda p: -p["last_used"])
 
 
 def match_proc(pane, procs: list[ClaudeProc]) -> ClaudeProc | None:

@@ -10,9 +10,29 @@ from http.server import ThreadingHTTPServer
 
 from cmgr.agent import Agent
 from cmgr.mux import ALLOWED_KEYS, MuxError, Pane
-from cmgr.server import Hub, make_handler
+from cmgr.server import Authorizer, Hub, make_handler
 
 TOKEN = "test-token"
+
+
+class FakeTS:
+    """Stands in for the tailscale CLI: my user id 1, my IP 100.0.0.1."""
+
+    def __init__(self, machines=(), owners=None):
+        self.machines = list(machines)
+        self.owners = owners or {}
+
+    def my_ips(self):
+        return ["100.0.0.1"]
+
+    def my_user(self):
+        return 1
+
+    def my_machines(self):
+        return self.machines
+
+    def owner_of(self, ip):
+        return self.owners.get(ip)
 
 
 class FakeMux:
@@ -48,9 +68,10 @@ class FakeMux:
         return name
 
 
-def start(cfg, agent, hub_enabled):
-    hub = Hub(cfg, agent) if hub_enabled else None
-    srv = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(cfg, agent, hub))
+def start(cfg, agent, hub_enabled, ts=None):
+    ts = ts or FakeTS()
+    hub = Hub(cfg, agent, ts) if hub_enabled else None
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(cfg, agent, hub, Authorizer(cfg, ts)))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv, f"http://127.0.0.1:{srv.server_address[1]}"
 
@@ -59,7 +80,8 @@ class ServerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory()
-        base = {"token": TOKEN, "accounts": [], "project_roots": [], "claude_command": "claude", "tmux": ""}
+        base = {"token": TOKEN, "accounts": [], "project_roots": [], "claude_command": "claude", "tmux": "",
+                "port": 1, "trust_local": False, "discover": False}
         cls.peer_mux = FakeMux("lab")
         peer_cfg = {**base, "name": "peer", "_path": os.path.join(cls.tmp.name, "peer.json")}
         cls.peer_agent = Agent(peer_cfg, mux=cls.peer_mux)
@@ -156,6 +178,10 @@ class ServerTests(unittest.TestCase):
         code, st = self.req("GET", "/hub/state")
         self.assertEqual(st["prefs"]["perplexity"]["trnsfr"], "https://www.perplexity.ai/search/abc")
         self.assertEqual(self.req("POST", "/hub/prefs", {"section": "evil", "key": "k", "value": 1})[0], 400)
+        # written to the peer too, so the peer's own page shows the same link
+        self.assertEqual(self.peer_agent.prefs()["perplexity"]["trnsfr"], "https://www.perplexity.ai/search/abc")
+        self.req("POST", "/hub/prefs", {"section": "perplexity", "key": "trnsfr", "value": ""})
+        self.assertNotIn("trnsfr", self.peer_agent.prefs()["perplexity"])
 
     def test_new_session_validates(self):
         code, _ = self.req("POST", "/hub/new", {"host": "hub", "cwd": os.path.join(self.tmp.name, "missing")})
@@ -165,6 +191,58 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(self.hub_mux.created[3], "claude --continue")
         code, _ = self.req("POST", "/hub/new", {"host": "hub", "cwd": self.tmp.name, "account_dir": "/not/an/account"})
         self.assertEqual(code, 400)
+
+
+class AuthorizerTests(unittest.TestCase):
+    def ts(self):
+        return FakeTS(owners={"100.0.0.7": 1, "100.0.0.9": 2})
+
+    def test_own_tailscale_devices_need_no_token(self):
+        a = Authorizer({"token": "", "trust_local": False}, self.ts())
+        self.assertTrue(a.check("100.0.0.7", "")[0])          # my phone / other PC
+        self.assertFalse(a.check("100.0.0.9", "")[0])         # a machine shared in by someone else
+        self.assertFalse(a.check("100.0.0.8", "")[0])         # unknown
+
+    def test_local_connections(self):
+        strict = Authorizer({"token": "t", "trust_local": False}, self.ts())
+        self.assertFalse(strict.check("127.0.0.1", "")[0])    # other users on a shared Linux box
+        self.assertFalse(strict.check("100.0.0.1", "")[0])    # ... also via the box's own Tailscale IP
+        self.assertTrue(strict.check("127.0.0.1", "t")[0])
+        self.assertTrue(Authorizer({"trust_local": True}, self.ts()).check("127.0.0.1", "")[0])
+
+    def test_token_always_works_and_wrong_token_does_not(self):
+        a = Authorizer({"token": "t", "trust_local": False}, self.ts())
+        self.assertTrue(a.check("8.8.8.8", "t")[0])
+        self.assertFalse(a.check("8.8.8.8", "x")[0])
+        self.assertFalse(Authorizer({"token": ""}, self.ts()).check("8.8.8.8", "")[0])
+
+    def test_tailscale_can_be_disabled(self):
+        a = Authorizer({"token": "", "trust_local": False, "allow_tailscale": False}, self.ts())
+        self.assertFalse(a.check("100.0.0.7", "")[0])
+
+
+class DiscoveryTests(unittest.TestCase):
+    def test_hub_finds_cm_on_my_machines(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        mux = FakeMux("lab")
+        peer_cfg = {"name": "labbox", "token": "", "accounts": [], "project_roots": [], "tmux": "",
+                    "_path": os.path.join(tmp.name, "p.json"), "trust_local": True}
+        peer_agent = Agent(peer_cfg, mux=mux)
+        peer_agent._accounts, peer_agent._accounts_at = [], 1e18
+        srv, url = start(peer_cfg, peer_agent, False, ts=FakeTS())
+        self.addCleanup(srv.shutdown)
+        port = int(url.rsplit(":", 1)[1])
+        hub_cfg = {"name": "me", "token": "", "accounts": [], "project_roots": [], "tmux": "", "port": port,
+                   "_path": os.path.join(tmp.name, "h.json"), "peers": [], "discover": True}
+        hub_agent = Agent(hub_cfg, mux=FakeMux("work"))
+        hub_agent._accounts, hub_agent._accounts_at = [], 1e18
+        ts = FakeTS(machines=[{"name": "labbox", "ip": "127.0.0.1"}, {"name": "dead", "ip": "127.0.0.2"}])
+        hub = Hub(hub_cfg, hub_agent, ts)
+        st = hub.state()
+        names = {h["name"]: h for h in st["hosts"]}
+        self.assertEqual(set(names), {"me", "labbox"})   # 127.0.0.2 has no cm -> not listed
+        self.assertEqual(names["labbox"]["sessions"][0]["target"], "lab:0.0")
 
 
 import urllib.parse  # noqa: E402

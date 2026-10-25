@@ -18,7 +18,8 @@
 <div id="login" class="login" hidden>
   <form id="login-form" class="login-card">
     <h1>Claude Manager</h1>
-    <p>Paste the token from <code>~/.claude-manager/config.json</code> on any machine.</p>
+    <p>Devices of your own Tailscale account get in without this. From anywhere else, paste the token from
+       <code>~/.claude-manager/config.json</code>.</p>
     <input id="login-token" type="password" autocomplete="current-password" placeholder="token" required>
     <button class="btn primary" type="submit">Connect</button>
     <p id="login-error" class="error" hidden></p>
@@ -66,6 +67,7 @@
           <span id="s-title"></span>
           <span id="s-meta" class="sub"></span>
         </div>
+        <a class="icon-btn" id="rc-btn" target="_blank" rel="noopener" title="Open in the Claude app (Remote Control is on for this session)" hidden>☁</a>
         <button class="icon-btn" id="fit-btn" title="Wrap / fit-to-width">↔</button>
         <button class="icon-btn" id="font-down" title="Smaller text">A-</button>
         <button class="icon-btn" id="font-up" title="Larger text">A+</button>

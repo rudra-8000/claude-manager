@@ -26,6 +26,8 @@ def _expand(raw: str) -> str:
         s = re.sub(pat, lambda _m: home, s, flags=re.I)
     if s.startswith("~"):
         s = home + s[1:]
+    if os.sep == "/":
+        s = s.replace("\\", "/")  # a PowerShell-style path read on Linux
     return os.path.normpath(s)
 
 
