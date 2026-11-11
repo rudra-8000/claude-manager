@@ -75,14 +75,26 @@ def cmd_up(a) -> None:
     # typed into the session's shell, so a crash stays readable with `tmux attach -t cm`
     cmd = (f'& "{exe}"' if sys.platform == "win32" else f'"{exe}"') + args
     mux.new_session(SESSION, PKG_PARENT, {}, cmd)
-    time.sleep(3.0)
     from .claude_state import strip_ansi
-    out = [ln for ln in strip_ansi(mux.capture(SESSION)).splitlines() if ln.strip()]
+    # Wait for a clear outcome instead of a fixed delay: startup includes Tailscale queries that can take
+    # seconds (2.8 s seen on a busy server), and a 3 s guess killed a server that was still starting.
+    started = failed = False
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        time.sleep(0.5)
+        out = [ln for ln in strip_ansi(mux.capture(SESSION)).splitlines() if ln.strip()]
+        started = any("listening on" in ln for ln in out)
+        failed = any("could not listen" in ln or "Traceback" in ln for ln in out)
+        if started or failed:
+            break
     tail = [ln for ln in out if "[cm]" in ln or "Error" in ln or "error" in ln][-6:]
     print("\n".join(tail) if tail else "\n".join(out[-6:]))
-    if not any("listening on" in ln for ln in out):
+    if failed:
         mux._run("kill-session", "-t", SESSION)
         raise SystemExit("\ncm did NOT start (see above). Nothing is left running.")
+    if not started:
+        print(f"\nstill starting after 20 s; left running - check with: tmux attach -t {SESSION}")
+        return
     print(f"\nrunning in tmux session '{SESSION}' (see it with: tmux attach -t {SESSION}, leave with Ctrl-b d)")
     print("open: " + "  or  ".join(_urls(cfg)))
 
