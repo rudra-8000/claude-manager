@@ -32,13 +32,48 @@ class TailscaleTests(unittest.TestCase):
         ts = Tailscale(status_fn=lambda: {"BackendState": "NeedsLogin"}, whois_fn=lambda ip: None)
         self.assertEqual((ts.my_machines(), ts.my_ips(), ts.my_user()), ([], [], None))
 
-    def test_whois_cached(self):
+    def test_known_peers_are_answered_from_the_peer_list(self):
         calls = []
+        ts = Tailscale(status_fn=lambda: STATUS, whois_fn=lambda ip: calls.append(ip))
+        self.assertEqual(ts.owner_of("100.115.0.1"), 5)        # computenode, mine
+        self.assertEqual(ts.owner_of("100.116.0.1"), 5)        # offline peer, still mine
+        self.assertEqual(ts.owner_of("100.103.0.1"), 99)       # someone else's machine
+        self.assertEqual(calls, [])                            # no whois needed
+
+    def test_whois_fallback_caches_answers_but_not_failures(self):
+        calls, answer = [], {"v": None}
         ts = Tailscale(status_fn=lambda: STATUS,
-                       whois_fn=lambda ip: calls.append(ip) or {"UserProfile": {"ID": 5, "LoginName": "x"}})
+                       whois_fn=lambda ip: calls.append(ip) or (answer["v"] and {"UserProfile": {"ID": answer["v"]}}))
+        self.assertIsNone(ts.owner_of("100.99.0.9"))            # whois failed (e.g. tailscaled restarting)
+        answer["v"] = 5
+        self.assertEqual(ts.owner_of("100.99.0.9"), 5)          # retried right away, not stuck on the failure
+        self.assertEqual(ts.owner_of("100.99.0.9"), 5)
+        self.assertEqual(calls, ["100.99.0.9", "100.99.0.9"])   # the good answer was cached
+
+    def test_failed_status_keeps_the_last_good_one(self):
+        t = {"now": 0.0}
+        state = {"v": STATUS}
+        ts = Tailscale(status_fn=lambda: state["v"], whois_fn=lambda ip: None, clock=lambda: t["now"])
+        self.assertEqual(ts.my_user(), 5)
+        state["v"] = None                                       # tailscaled restarting
+        t["now"] += 31
+        self.assertEqual(ts.my_user(), 5)                       # still trusted
         self.assertEqual(ts.owner_of("100.115.0.1"), 5)
-        self.assertEqual(ts.owner_of("100.115.0.1"), 5)
-        self.assertEqual(calls, ["100.115.0.1"])
+        t["now"] += 700                                         # down for more than 10 minutes
+        self.assertIsNone(ts.my_user())
+        state["v"] = STATUS
+        t["now"] += 31
+        self.assertEqual(ts.my_user(), 5)                       # recovers on the next refresh
+
+    def test_refusal_says_why(self):
+        from cmgr.server import Authorizer
+        ts = Tailscale(status_fn=lambda: STATUS, whois_fn=lambda ip: None)
+        a = Authorizer({"token": "", "trust_local": False}, ts)
+        self.assertEqual(a.check("100.115.0.1", ""), (True, ""))
+        self.assertIn("another Tailscale user", a.check("100.103.0.1", "")[1])
+        self.assertIn("isn't a device Tailscale knows", a.check("100.1.2.3", "")[1])
+        down = Authorizer({"token": ""}, Tailscale(status_fn=lambda: None, whois_fn=lambda ip: None))
+        self.assertIn("Tailscale isn't answering", down.check("100.115.0.1", "")[1])
 
 
 class KnownProjectsTests(unittest.TestCase):

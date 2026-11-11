@@ -47,22 +47,36 @@ def parse_status(d: dict | None) -> dict:
         if not ips:
             continue
         peers.append({"name": p.get("HostName", ""), "dns": (p.get("DNSName") or "").rstrip("."), "ip": ips[0],
+                      "ips": list(p.get("TailscaleIPs") or []),
                       "os": (p.get("OS") or "").lower(), "online": bool(p.get("Online")), "user_id": p.get("UserID")})
     return {"running": True, "self": me, "peers": peers}
 
 
+KEEP_GOOD_FOR = 600.0   # a failed `tailscale status` keeps the last good answer this long
+
+
 class Tailscale:
-    def __init__(self, status_fn=None, whois_fn=None):
+    """Caches use time.monotonic(), so a clock change can't freeze them, and a failed CLI call never
+    replaces a good answer: a tailscaled restart must not lock your own devices out."""
+
+    def __init__(self, status_fn=None, whois_fn=None, clock=time.monotonic):
         self._status_fn = status_fn or (lambda: _run_json("status", "--json"))
         self._whois_fn = whois_fn or (lambda ip: _run_json("whois", "--json", ip))
-        self._status, self._status_at = None, 0.0
+        self._clock = clock
+        self._status, self._status_at, self._good_at = None, 0.0, None
         self._whois: dict[str, tuple[float, object]] = {}
         self._lock = threading.Lock()
 
     def status(self, max_age: float = 30.0) -> dict:
         with self._lock:
-            if self._status is None or time.time() - self._status_at > max_age:
-                self._status, self._status_at = parse_status(self._status_fn()), time.time()
+            now = self._clock()
+            if self._status is None or now - self._status_at > max_age:
+                fresh = parse_status(self._status_fn())
+                if fresh["running"]:
+                    self._status, self._good_at = fresh, now
+                elif self._status is None or self._good_at is None or now - self._good_at > KEEP_GOOD_FOR:
+                    self._status = fresh
+                self._status_at = now
             return self._status
 
     def my_ips(self) -> list[str]:
@@ -95,14 +109,18 @@ class Tailscale:
         return [p for p in st["peers"] if p["online"] and p["user_id"] == uid and p["os"] not in PHONE_OS]
 
     def owner_of(self, ip: str):
-        """Tailscale user id that owns the device at `ip`, or None (cached)."""
-        now = time.time()
+        """Tailscale user id that owns the device at `ip`, or None. Answered from the peer list (refreshed
+        every 30 s); `tailscale whois` is only asked about addresses that aren't in it. Failures aren't cached."""
+        for p in self.status()["peers"]:
+            if ip == p["ip"] or ip in p.get("ips", ()):
+                return p["user_id"]
+        now = self._clock()
         hit = self._whois.get(ip)
-        if hit and now - hit[0] < (300 if hit[1] is not None else 30):
+        if hit and now - hit[0] < 300:
             return hit[1]
-        d = self._whois_fn(ip)
-        uid = ((d or {}).get("UserProfile") or {}).get("ID")
-        self._whois[ip] = (now, uid)
+        uid = ((self._whois_fn(ip) or {}).get("UserProfile") or {}).get("ID")
+        if uid is not None:
+            self._whois[ip] = (now, uid)
         return uid
 
 

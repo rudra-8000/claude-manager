@@ -38,7 +38,7 @@ Tailscale account (phones and machines shared in by other people are left out) a
 Switch devices on and off to choose whose sessions you see. In the same panel, switch accounts off to hide their
 sessions. Usage stays visible on the right either way.
 
-- **Who can connect to the page:** only your own Tailscale devices, checked with `tailscale whois`. No token.
+- **Who can connect to the page:** only your own Tailscale devices (from the hub's `tailscale status` peer list). No token.
 - **Accounts** are found automatically on every machine: `~/.claude`, `~/.claude-*`, and any config dir your shell
   aliases or functions point at. Your alias names (`claude-b`, `claude-rudra`) become the labels.
 - **Projects** are the folders you have used Claude Code in, from Claude Code's own history, newest first.
@@ -153,7 +153,7 @@ from localhost.
 ## Development
 
 ```bash
-python -m pytest -q tests      # 57 tests
+python -m pytest -q tests      # 60 tests
 ```
 
 Architecture decisions are recorded in [DECISIONS.md](DECISIONS.md).

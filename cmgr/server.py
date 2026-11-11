@@ -455,8 +455,14 @@ class Authorizer:
             return False, "connections from this machine itself need the token here (or set trust_local)"
         if self.allow_tailscale:
             me = self.ts.my_user()
-            if me is not None and self.ts.owner_of(ip) == me:
+            if me is None:
+                return False, f"can't check {ip}: Tailscale isn't answering on this server (is tailscaled running?)"
+            owner = self.ts.owner_of(ip)
+            if owner == me:
                 return True, ""
+            if owner is None:
+                return False, f"{ip} isn't a device Tailscale knows on this server, and no valid token"
+            return False, f"{ip} belongs to another Tailscale user, and no valid token"
         return False, "not one of your Tailscale devices, and no valid token"
 
 
