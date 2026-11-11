@@ -57,6 +57,12 @@ def _stop(mux) -> bool:
     return True
 
 
+def _server_alive(port: int) -> bool:
+    """Is a cm server actually listening (not just a leftover 'cm' tmux session)?"""
+    from . import ports
+    return any(h["is_cm"] for h in ports.holders(port))
+
+
 def cmd_up(a) -> None:
     from .mux import Mux
     cfg = _cfg(a)
@@ -64,16 +70,24 @@ def cmd_up(a) -> None:
     if not mux.available():
         raise SystemExit(f"tmux / psmux not found ({mux.binary})")
     if SESSION in mux.session_names():
-        if not a.restart:
+        alive = _server_alive(int(cfg["port"]))
+        if alive and not a.restart:
             print(f"already running in tmux session '{SESSION}' (use --restart after `git pull`)")
             print("open: " + "  or  ".join(_urls(cfg)))
             return
+        if not alive:
+            print(f"the '{SESSION}' tmux session exists but its server had stopped; starting it again")
         _stop(mux)
     _free_port(int(cfg["port"]))
     exe = sys.executable
     args = " -m cmgr serve" + (f" --port {a.port}" if a.port else "") + (f' --config "{a.config}"' if a.config else "")
-    # typed into the session's shell, so a crash stays readable with `tmux attach -t cm`
-    cmd = (f'& "{exe}"' if sys.platform == "win32" else f'"{exe}"') + args
+    # Typed into the session's shell, so a crash stays readable with `tmux attach -t cm`. Wrapped in a loop
+    # so a stray Ctrl-C (or a crash) restarts it; a second Ctrl-C during the pause stops it for good.
+    note = "[cm] server stopped - restarting in 5 s (press Ctrl-C again to stop it for good)"
+    if sys.platform == "win32":
+        cmd = f'while ($true) {{ & "{exe}"{args}; Write-Host "{note}"; Start-Sleep 5 }}'
+    else:
+        cmd = f'while :; do "{exe}"{args}; echo "{note}"; sleep 5; done'
     mux.new_session(SESSION, PKG_PARENT, {}, cmd)
     from .claude_state import strip_ansi
     # Wait for a clear outcome instead of a fixed delay: startup includes Tailscale queries that can take
