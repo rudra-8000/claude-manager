@@ -1,14 +1,23 @@
 """Tailscale as the zero-config layer: who am I, which of my machines are online, and is a caller
-one of my own devices. Uses the `tailscale` CLI (read-only LocalAPI calls, fine as a normal user)."""
+one of my own devices.
+
+On Linux/macOS it asks tailscaled directly over its local socket (read-only LocalAPI, open to normal
+users): ~0.5 ms, no process to start. Starting the `tailscale` CLI instead took 19.7 s on a server
+under memory pressure (the binary had been paged out), which made own devices look like strangers.
+The CLI stays as the fallback (and on Windows) with a generous timeout."""
 from __future__ import annotations
 
+import http.client
 import ipaddress
 import json
+import os
 import shutil
+import socket
 import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 
 _NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 PHONE_OS = {"ios", "android"}
@@ -18,7 +27,57 @@ def _exe() -> str | None:
     return shutil.which("tailscale") or (r"C:\Program Files\Tailscale\tailscale.exe" if sys.platform == "win32" else None)
 
 
-def _run_json(*args: str, timeout: float = 5.0):
+SOCKET_PATHS = ["/var/run/tailscale/tailscaled.sock", "/run/tailscale/tailscaled.sock",
+                "/var/run/tailscaled.socket"]
+CLI_TIMEOUT = 30.0
+
+
+class _UnixHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, path: str, timeout: float):
+        super().__init__("local-tailscaled.sock", timeout=timeout)
+        self._path = path
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(self._path)
+
+
+def _socket_path() -> str | None:
+    if not hasattr(socket, "AF_UNIX"):
+        return None
+    for p in [os.environ.get("TS_SOCKET", "")] + SOCKET_PATHS:
+        if p and os.path.exists(p):
+            return p
+    return None
+
+
+def localapi(path: str, timeout: float = 10.0):
+    """GET a tailscaled LocalAPI endpoint over the unix socket; parsed JSON, or None if unavailable."""
+    sock = _socket_path()
+    if not sock:
+        return None
+    conn = _UnixHTTPConnection(sock, timeout)
+    try:
+        conn.request("GET", path, headers={"Host": "local-tailscaled.sock"})
+        r = conn.getresponse()
+        body = r.read()
+        return json.loads(body) if r.status == 200 else None
+    except (OSError, ValueError, http.client.HTTPException):
+        return None
+    finally:
+        conn.close()
+
+
+def get_status():
+    return localapi("/localapi/v0/status") or _run_json("status", "--json")
+
+
+def get_whois(ip: str):
+    return localapi("/localapi/v0/whois?addr=" + urllib.parse.quote(ip)) or _run_json("whois", "--json", ip)
+
+
+def _run_json(*args: str, timeout: float = CLI_TIMEOUT):
     exe = _exe()
     if not exe:
         return None
@@ -52,31 +111,49 @@ def parse_status(d: dict | None) -> dict:
     return {"running": True, "self": me, "peers": peers}
 
 
-KEEP_GOOD_FOR = 600.0   # a failed `tailscale status` keeps the last good answer this long
-
-
 class Tailscale:
-    """Caches use time.monotonic(), so a clock change can't freeze them, and a failed CLI call never
-    replaces a good answer: a tailscaled restart must not lock your own devices out."""
+    """The peer list is refreshed in the background, so a request never waits on Tailscale, and a failed
+    refresh never replaces a good answer: no device can reach this machine's Tailscale address while
+    Tailscale is down anyway, so the last good list stays valid. Caches use time.monotonic()."""
 
-    def __init__(self, status_fn=None, whois_fn=None, clock=time.monotonic):
-        self._status_fn = status_fn or (lambda: _run_json("status", "--json"))
-        self._whois_fn = whois_fn or (lambda ip: _run_json("whois", "--json", ip))
+    def __init__(self, status_fn=None, whois_fn=None, clock=time.monotonic, background: bool = True):
+        self._status_fn = status_fn or get_status
+        self._whois_fn = whois_fn or get_whois
         self._clock = clock
+        self._background = background
         self._status, self._status_at, self._good_at = None, 0.0, None
         self._whois: dict[str, tuple[float, object]] = {}
         self._lock = threading.Lock()
+        self._refreshing = False
+
+    def _refresh(self) -> None:
+        try:
+            fresh = parse_status(self._status_fn())
+        except Exception:
+            fresh = parse_status(None)
+        with self._lock:
+            if fresh["running"] or self._good_at is None:   # never replace a good answer with a failure
+                self._status = fresh
+                if fresh["running"]:
+                    self._good_at = self._clock()
+            self._status_at = self._clock()
+            self._refreshing = False
 
     def status(self, max_age: float = 30.0) -> dict:
         with self._lock:
-            now = self._clock()
-            if self._status is None or now - self._status_at > max_age:
-                fresh = parse_status(self._status_fn())
-                if fresh["running"]:
-                    self._status, self._good_at = fresh, now
-                elif self._status is None or self._good_at is None or now - self._good_at > KEEP_GOOD_FOR:
-                    self._status = fresh
-                self._status_at = now
+            have = self._status is not None
+            start = (not have or self._clock() - self._status_at > max_age) and not self._refreshing
+            if start:
+                self._refreshing = True
+        if start:
+            if have and self._background:   # answer from what we have; refresh behind it
+                threading.Thread(target=self._refresh, daemon=True).start()
+            else:
+                self._refresh()
+        elif not have:                      # another thread is fetching the very first answer
+            while self._status is None:
+                time.sleep(0.05)
+        with self._lock:
             return self._status
 
     def my_ips(self) -> list[str]:

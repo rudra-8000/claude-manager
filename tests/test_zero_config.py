@@ -53,17 +53,70 @@ class TailscaleTests(unittest.TestCase):
     def test_failed_status_keeps_the_last_good_one(self):
         t = {"now": 0.0}
         state = {"v": STATUS}
-        ts = Tailscale(status_fn=lambda: state["v"], whois_fn=lambda ip: None, clock=lambda: t["now"])
+        ts = Tailscale(status_fn=lambda: state["v"], whois_fn=lambda ip: None, clock=lambda: t["now"], background=False)
         self.assertEqual(ts.my_user(), 5)
-        state["v"] = None                                       # tailscaled restarting
+        state["v"] = None                                       # tailscaled restarting / CLI timing out
         t["now"] += 31
         self.assertEqual(ts.my_user(), 5)                       # still trusted
         self.assertEqual(ts.owner_of("100.115.0.1"), 5)
-        t["now"] += 700                                         # down for more than 10 minutes
-        self.assertIsNone(ts.my_user())
-        state["v"] = STATUS
+        t["now"] += 7200                                        # failing for two hours: still the last good list
+        self.assertEqual(ts.my_user(), 5)
+        changed = json.loads(json.dumps(STATUS))
+        changed["Peer"]["a"]["UserID"] = 77
+        state["v"] = changed
         t["now"] += 31
-        self.assertEqual(ts.my_user(), 5)                       # recovers on the next refresh
+        self.assertEqual(ts.owner_of("100.115.0.1"), 77)        # a working refresh replaces it
+
+    def test_requests_never_wait_for_a_slow_refresh(self):
+        import threading
+        gate, calls = threading.Event(), []
+
+        def slow_status():
+            calls.append(1)
+            if len(calls) > 1:
+                gate.wait(10)                                   # the CLI taking 20 s to start
+            return STATUS
+        t = {"now": 0.0}
+        ts = Tailscale(status_fn=slow_status, whois_fn=lambda ip: None, clock=lambda: t["now"])
+        self.assertEqual(ts.my_user(), 5)                       # first answer is fetched synchronously
+        t["now"] += 31
+        t0 = time.time()
+        self.assertEqual(ts.owner_of("100.115.0.1"), 5)         # stale, refresh starts in the background...
+        self.assertEqual(ts.my_user(), 5)
+        self.assertLess(time.time() - t0, 1)                    # ...and nobody waited for it
+        self.assertEqual(len(calls), 2)                         # exactly one refresh in flight
+        gate.set()
+
+    def test_localapi_over_a_unix_socket(self):
+        import socket as _s
+        import threading
+        from cmgr import tailscale as tsmod
+        if not hasattr(_s, "AF_UNIX"):
+            self.skipTest("no unix sockets here")
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "ts.sock")
+        srv = _s.socket(_s.AF_UNIX, _s.SOCK_STREAM)
+        srv.bind(path)
+        srv.listen(1)
+        seen = {}
+
+        def serve():
+            c, _ = srv.accept()
+            seen["req"] = c.recv(4096).decode()
+            body = json.dumps(STATUS).encode()
+            c.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
+            c.close()
+        threading.Thread(target=serve, daemon=True).start()
+        old = tsmod.SOCKET_PATHS
+        tsmod.SOCKET_PATHS = [path]
+        try:
+            os.environ.pop("TS_SOCKET", None)
+            self.assertEqual(tsmod.localapi("/localapi/v0/status")["Self"]["UserID"], 5)
+            self.assertIn("GET /localapi/v0/status", seen["req"])
+            self.assertIn("Host: local-tailscaled.sock", seen["req"])
+        finally:
+            tsmod.SOCKET_PATHS = old
+            srv.close()
 
     def test_refusal_says_why(self):
         from cmgr.server import Authorizer

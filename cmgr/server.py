@@ -563,9 +563,14 @@ def make_handler(cfg: dict, agent: Agent, hub: Hub | None, auth: Authorizer | No
 
 
 def tailscale_ip() -> str | None:
+    from .tailscale import localapi
+    st = localapi("/localapi/v0/status")   # instant; the CLI can take 20 s to start on a loaded server
+    for ip in ((st or {}).get("Self") or {}).get("TailscaleIPs") or []:
+        if re.fullmatch(r"\d+\.\d+\.\d+\.\d+", ip):
+            return ip
     for exe in ("tailscale", r"C:\Program Files\Tailscale\tailscale.exe"):
         try:
-            out = subprocess.run([exe, "ip", "-4"], capture_output=True, text=True, timeout=5,
+            out = subprocess.run([exe, "ip", "-4"], capture_output=True, text=True, timeout=30,
                                  creationflags=0x08000000 if sys.platform == "win32" else 0).stdout
             ip = out.strip().splitlines()[0] if out.strip() else ""
             if re.fullmatch(r"\d+\.\d+\.\d+\.\d+", ip):  # not "no current Tailscale IPs; state: ..."
